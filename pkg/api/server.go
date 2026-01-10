@@ -144,7 +144,26 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 			"checksum": meta.Checksum,
 			"chunks":   meta.TotalChunks,
 		})
+
+	case http.MethodGet:
+		data, err := s.lio.GetObject(bucket, key)
+		if err != nil {
+			errorResponse(w, http.StatusNotFound, err.Error())
+			return
+		}
+
+		metadata, err := s.lio.HeadObject(bucket, key)
+		contentType := "application/octet-stream"
+		if metadata != nil {
+			contentType = metadata.ContentType
+		}
+
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
 	}
+
 }
 
 func (s *Server) Start() error {
@@ -155,7 +174,7 @@ func (s *Server) Start() error {
 ╔════════════════════════════════════════════════════════════╗
 ║              Mini S3 HTTP API Server (Go)                  ║
 ╠════════════════════════════════════════════════════════════╣
-║  Server running at: http://%s
+║  Server running at: http://%s                              ║
 ║                                                            ║
 ║  API Endpoints:                                            ║
 ║    GET    /                    - List buckets              ║

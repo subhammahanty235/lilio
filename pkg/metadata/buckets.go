@@ -110,3 +110,26 @@ func (m *MetadataStore) SaveObjectMetadata(meta *ObjectMetadata) error {
 
 	return nil
 }
+
+func (m *MetadataStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	safeKey := strings.ReplaceAll(key, "/", "_")
+	metaFile := filepath.Join(m.BucketsPath, bucket, safeKey+".json")
+
+	data, err := os.ReadFile(metaFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("object not found: %s/%s", bucket, key)
+		}
+		return nil, fmt.Errorf("failed to read metadata: %w", err)
+	}
+
+	var meta ObjectMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("failed to parse metadata: %w", err)
+	}
+
+	return &meta, nil
+}
