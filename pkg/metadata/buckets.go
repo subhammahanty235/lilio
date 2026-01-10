@@ -133,3 +133,46 @@ func (m *MetadataStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, 
 
 	return &meta, nil
 }
+
+func (m *MetadataStore) DeleteObjectMetadata(bucket, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	safeKey := strings.ReplaceAll(key, "/", "_")
+	metaFile := filepath.Join(m.BucketsPath, bucket, safeKey+".json")
+
+	if err := os.Remove(metaFile); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("object not found: %s/%s", bucket, key)
+		}
+		return fmt.Errorf("failed to delete metadata: %w", err)
+	}
+
+	return nil
+}
+
+func (m *MetadataStore) ListObjects(bucket, prefix string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	bucketPath := filepath.Join(m.BucketsPath, bucket)
+
+	entries, err := os.ReadDir(bucketPath)
+	if err != nil {
+		return nil, fmt.Errorf("bucket not found: %s", bucket)
+	}
+
+	var objects []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+			key := strings.TrimSuffix(entry.Name(), ".json")
+			key = strings.ReplaceAll(key, "_", "/")
+
+			if strings.HasPrefix(key, prefix) {
+				objects = append(objects, key)
+			}
+		}
+	}
+
+	return objects, nil
+}

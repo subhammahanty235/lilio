@@ -63,3 +63,31 @@ func CalculateChecksum(data []byte) string {
 	hash := md5.Sum(data)
 	return hex.EncodeToString(hash[:])
 }
+
+func (s *StorageNode) DeleteChunk(chunkID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	chunkPath := filepath.Join(s.BasePath, chunkID)
+
+	if err := os.Remove(chunkPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to delete chunk %s: %w", chunkID, err)
+	}
+
+	return nil
+}
+
+func (s *StorageNode) GetStats() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return map[string]interface{}{
+		"node_id":       s.NodeId,
+		"path":          s.BasePath,
+		"chunks_stored": s.ChunkStored,
+		"bytes_stored":  s.BytesStored,
+	}
+}

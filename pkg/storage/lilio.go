@@ -286,3 +286,41 @@ func (s *Lilio) GetObject(bucket, key string) ([]byte, error) {
 func (s *Lilio) HeadObject(bucket, key string) (*metadata.ObjectMetadata, error) {
 	return s.Metadata.GetObjectMetadata(bucket, key)
 }
+
+func (s *Lilio) DeleteObject(bucket, key string) error {
+	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
+	if err != nil {
+		return err
+	}
+
+	// Delete all chunks
+	for _, chunkInfo := range meta.Chunks {
+		for _, nodeID := range chunkInfo.StorageNodes {
+			s.mu.RLock()
+			node, exists := s.StorageNodes[nodeID]
+			s.mu.RUnlock()
+
+			if exists {
+				node.DeleteChunk(chunkInfo.ChunkID)
+			}
+		}
+	}
+
+	return s.Metadata.DeleteObjectMetadata(bucket, key)
+}
+
+func (s *Lilio) ListObjects(bucket, prefix string) ([]string, error) {
+	return s.Metadata.ListObjects(bucket, prefix)
+}
+
+// Storage stats
+func (s *Lilio) GetStorageStats() map[string]map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	stats := make(map[string]map[string]interface{})
+	for nodeID, node := range s.StorageNodes {
+		stats[nodeID] = node.GetStats()
+	}
+	return stats
+}

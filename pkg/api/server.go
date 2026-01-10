@@ -86,6 +86,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleBucketsOrObjects(w http.ResponseWriter, r *http.Request) {
 	bucket, key := parsePath(r.URL.Path)
+	if bucket == "admin" && key == "stats" {
+		stats := s.lio.GetStorageStats()
+		jsonResponse(w, http.StatusOK, stats)
+		return
+	}
+
 	// NO KEY PROVIDED: bucket operations
 	if key == "" {
 		s.handleBucket(w, r, bucket)
