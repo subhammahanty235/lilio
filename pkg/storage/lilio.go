@@ -17,15 +17,15 @@ type Lilio struct {
 	ChunkSize         int
 	ReplicationFactor int
 
-	StorageNodes map[string]*StorageNode
-	Metadata     *metadata.MetadataStore
+	// StorageNodes map[string]*StorageNode
+	Registry *Registry
+	Metadata *metadata.MetadataStore
 
 	mu sync.RWMutex
 }
 
 type Config struct {
 	BasePath          string
-	NumStorageNodes   int
 	ChunkSize         int
 	ReplicationFactor int
 }
@@ -33,7 +33,6 @@ type Config struct {
 func DefaultConig() Config {
 	return Config{
 		BasePath:          "./lilio_data",
-		NumStorageNodes:   4,
 		ChunkSize:         1024 * 1024,
 		ReplicationFactor: 2,
 	}
@@ -46,32 +45,39 @@ func NewLilioInstance(cfg Config) (*Lilio, error) {
 		return nil, fmt.Errorf("Failed to create metadata store: %w", err)
 	}
 
-	nodes := make(map[string]*StorageNode)
-	for i := 0; i < cfg.NumStorageNodes; i++ {
-		nodeId := fmt.Sprintf("node_%d", i)
-		nodePath := filepath.Join(cfg.BasePath, "storage_nodes", nodeId)
-		node, err := NewStorageNode(nodeId, nodePath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create storage node %s: %w", nodeId, err)
-		}
-
-		nodes[nodeId] = node
-	}
+	registry := NewRegistry()
 
 	obj := &Lilio{
 		BasePath:          cfg.BasePath,
 		ChunkSize:         cfg.ChunkSize,
 		ReplicationFactor: cfg.ReplicationFactor,
-		StorageNodes:      nodes,
+		Registry:          registry,
 		Metadata:          metadataStore,
 	}
 
-	fmt.Printf("MiniS3 initialized:\n")
-	fmt.Printf("  - Storage nodes: %d\n", cfg.NumStorageNodes)
+	fmt.Printf("Lilio initialized:\n")
 	fmt.Printf("  - Chunk size: %d KB\n", cfg.ChunkSize/1024)
 	fmt.Printf("  - Replication factor: %d\n", cfg.ReplicationFactor)
 
 	return obj, nil
+}
+
+func (s *Lilio) AddBackend(backend StorageBackend) error {
+	return s.Registry.Add(backend)
+}
+
+// RemoveBackend removes a storage backend
+func (s *Lilio) RemoveBackend(name string) error {
+	return s.Registry.Remove(name)
+}
+
+// ListBackends returns info about all backends
+func (s *Lilio) ListBackends() []BackendInfo {
+	var infos []BackendInfo
+	for _, backend := range s.Registry.List() {
+		infos = append(infos, backend.Info())
+	}
+	return infos
 }
 
 func (s *Lilio) ChunkData(data []byte) [][]byte {
@@ -84,21 +90,20 @@ func (s *Lilio) ChunkData(data []byte) [][]byte {
 	return chunks
 }
 
-func (s *Lilio) SelectNodesForChunk(chunkIndex int) []string {
+func (s *Lilio) SelectNodesForChunk(chunkIndex int) []StorageBackend {
 	// Get sorted node IDs for consistent selection
-	var nodeIDs []string
-	for id := range s.StorageNodes {
-		nodeIDs = append(nodeIDs, id)
+	allBackends := s.Registry.ListOnline()
+	if len(allBackends) == 0 {
+		return nil
 	}
-	sort.Strings(nodeIDs)
 
-	numNodes := len(nodeIDs)
+	numNodes := len(allBackends)
 	startPos := chunkIndex % numNodes
 
-	var selected []string
+	var selected []StorageBackend
 	for i := 0; i < s.ReplicationFactor && i < numNodes; i++ {
 		pos := (startPos + i) % numNodes
-		selected = append(selected, nodeIDs[pos])
+		selected = append(selected, allBackends[pos])
 	}
 
 	return selected
@@ -137,6 +142,9 @@ func (s *Lilio) PutObject(bucket, key string, data []byte, contentType string) (
 
 		chunkCheckSum := CalculateChecksum(chunkData)
 		targetNodes := s.SelectNodesForChunk(i)
+		if len(targetNodes) == 0 {
+			return nil, fmt.Errorf("no healthy backends available")
+		}
 
 		var successfulNodes []string
 		var wg sync.WaitGroup
@@ -144,20 +152,12 @@ func (s *Lilio) PutObject(bucket, key string, data []byte, contentType string) (
 
 		for _, nodeId := range targetNodes {
 			wg.Add(1)
-			go func(id string) {
+			go func(b StorageBackend) {
 				defer wg.Done()
 
-				s.mu.RLock()
-				node, exists := s.StorageNodes[id]
-				s.mu.RUnlock()
-
-				if !exists {
-					return
-				}
-
-				if err := node.StoreChunk(chunkId, chunkData); err == nil {
+				if err := b.StoreChunk(chunkId, chunkData); err == nil {
 					mu.Lock()
-					successfulNodes = append(successfulNodes, id)
+					successfulNodes = append(successfulNodes, b.Info().Name)
 					mu.Unlock()
 				}
 			}(nodeId)
@@ -167,6 +167,8 @@ func (s *Lilio) PutObject(bucket, key string, data []byte, contentType string) (
 		if len(successfulNodes) == 0 {
 			return nil, fmt.Errorf("failed to store chunk %d", i)
 		}
+
+		sort.Strings(successfulNodes)
 
 		chunkInfo := metadata.ChunkInfo{
 			ChunkID:      chunkId,
@@ -242,16 +244,13 @@ func (s *Lilio) GetObject(bucket, key string) ([]byte, error) {
 		// try each node that has this chunk
 
 		for _, nodeId := range chunkInfo.StorageNodes {
-			s.mu.Lock()
-			node, exists := s.StorageNodes[nodeId]
-			s.mu.Unlock()
-
-			if !exists {
+			backend, err := s.Registry.Get(nodeId)
+			if err != nil {
 				fmt.Printf("  ⚠ Chunk %d: %s unavailable, trying next...\n", chunkInfo.ChunkIndex, nodeId)
 				continue
 			}
 
-			data, err := node.RetrieveChunk(chunkInfo.ChunkID)
+			data, err := backend.RetrieveChunk(chunkInfo.ChunkID)
 			if err != nil {
 				continue
 			}
@@ -295,13 +294,10 @@ func (s *Lilio) DeleteObject(bucket, key string) error {
 
 	// Delete all chunks
 	for _, chunkInfo := range meta.Chunks {
-		for _, nodeID := range chunkInfo.StorageNodes {
-			s.mu.RLock()
-			node, exists := s.StorageNodes[nodeID]
-			s.mu.RUnlock()
-
-			if exists {
-				node.DeleteChunk(chunkInfo.ChunkID)
+		for _, backendName := range chunkInfo.StorageNodes {
+			backend, err := s.Registry.Get(backendName)
+			if err == nil {
+				backend.DeleteChunk(chunkInfo.ChunkID)
 			}
 		}
 	}
@@ -315,12 +311,24 @@ func (s *Lilio) ListObjects(bucket, prefix string) ([]string, error) {
 
 // Storage stats
 func (s *Lilio) GetStorageStats() map[string]map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	stats := make(map[string]map[string]interface{})
-	for nodeID, node := range s.StorageNodes {
-		stats[nodeID] = node.GetStats()
+
+	for _, backend := range s.Registry.List() {
+		info := backend.Info()
+		backendStats, _ := backend.Stats()
+
+		stats[info.Name] = map[string]interface{}{
+			"node_id":       info.Name,
+			"path":          info.Type,
+			"status":        info.Status,
+			"chunks_stored": backendStats.ChunksStored,
+			"bytes_stored":  backendStats.BytesUsed,
+		}
 	}
+
 	return stats
+}
+
+func (s *Lilio) HealthCheck() map[string]error {
+	return s.Registry.HealthCheck()
 }
