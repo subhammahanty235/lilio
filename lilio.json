@@ -1,0 +1,34 @@
+{
+  "lilio": {
+    "chunk_size": "1MB",
+    "replication_factor": 2,
+    "metadata_path": "./lilio_data/metadata",
+    "api_port": 8080
+  },
+  "storages": [
+    {
+      "name": "local-ssd",
+      "type": "local",
+      "priority": 1,
+      "options": {
+        "path": "./lilio_data/storage_nodes/local-ssd"
+      }
+    },
+    {
+      "name": "local-hdd",
+      "type": "local",
+      "priority": 2,
+      "options": {
+        "path": "./lilio_data/storage_nodes/local-hdd"
+      }
+    },
+    {
+      "name": "disk1",
+      "type": "local",
+      "priority": 10,
+      "options": {
+        "path": "./lilio_data/storage_nodes/local-hdd2"
+      }
+    }
+  ]
+}
