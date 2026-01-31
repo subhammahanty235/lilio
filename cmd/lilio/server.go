@@ -129,7 +129,17 @@ func createBackend(cfg config.StorageConfig) (storage.StorageBackend, error) {
 		return storagemodels.NewLocalBackendPod(cfg.Name, path, cfg.Priority)
 
 	case "gdrive":
-		return nil, fmt.Errorf("gdrive backend coming soon")
+		fmt.Printf("DEBUG: cfg.Options = %+v\n", cfg.Options)
+		credentials := cfg.GetOption("credentials", "")
+		fmt.Println(credentials)
+		if credentials == "" {
+			return nil, fmt.Errorf("gdrive requires 'credentials' option (path to credentials.json)")
+		}
+
+		tokenPath := cfg.GetOption("token_path", "./lilio_data/tokens/"+cfg.Name+"_token.json")
+		folderID := cfg.GetOption("folder_id", "")
+		return storagemodels.NewGDriveBackend(cfg.Name, credentials, tokenPath, folderID, cfg.Priority)
+		// return nil, fmt.Errorf("gdrive backend coming soon")
 
 	case "dropbox":
 		return nil, fmt.Errorf("dropbox backend coming soon")
