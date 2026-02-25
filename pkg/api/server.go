@@ -113,10 +113,33 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 		jsonResponse(w, http.StatusCreated, map[string]string{
 			"message": fmt.Sprintf("Bucket '%s' created", bucket),
 		})
-	}
 
 	// case get
+	case http.MethodGet:
+		// List objects in bucket
+		prefix := r.URL.Query().Get("prefix")
+		objects, err := s.lio.ListObjects(bucket, prefix)
+		if err != nil {
+			errorResponse(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"bucket":  bucket,
+			"objects": objects,
+		})
+	case http.MethodDelete:
+		// Delete bucket
+		if err := s.lio.Metadata.DeleteBucket(bucket); err != nil {
+			errorResponse(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]string{
+			"message": fmt.Sprintf("Bucket '%s' deleted", bucket),
+		})
 
+	default:
+		errorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 	// case delete
 
 }

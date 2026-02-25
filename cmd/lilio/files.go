@@ -173,10 +173,11 @@ func handleList() {
 
 	// List objects
 	url := fmt.Sprintf("%s/%s", *server, bucket)
+
 	if prefix != "" {
 		url += "?prefix=" + prefix
 	}
-
+	fmt.Println(url)
 	resp, err := http.Get(url)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
