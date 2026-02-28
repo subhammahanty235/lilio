@@ -3,37 +3,54 @@ package storage
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"path/filepath"
+	"io"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/subhammahanty235/lilio/pkg/crypto"
+	"github.com/subhammahanty235/lilio/pkg/hashing"
 	"github.com/subhammahanty235/lilio/pkg/metadata"
+	"github.com/subhammahanty235/lilio/pkg/utils"
 )
+
+type FailedBackend struct {
+	Name     string
+	Type     string
+	Priority int
+	Error    string
+}
 
 type Lilio struct {
 	BasePath          string
 	ChunkSize         int
 	ReplicationFactor int
 
-	StorageNodes map[string]*StorageNode
-	Metadata     *metadata.MetadataStore
+	// StorageNodes map[string]*StorageNode
+	Registry       *Registry
+	FailedBackends map[string]*FailedBackend // Track backends that failed to initialize
+	Metadata       metadata.MetadataStore
+	HashRing       *hashing.HashRing
+
+	encryptors map[string]*crypto.Encryptor
+	encMu      sync.RWMutex
 
 	mu sync.RWMutex
 }
 
 type Config struct {
 	BasePath          string
-	NumStorageNodes   int
 	ChunkSize         int
 	ReplicationFactor int
+	MetadataConfig    *metadata.Config
 }
 
 func DefaultConig() Config {
 	return Config{
 		BasePath:          "./lilio_data",
-		NumStorageNodes:   4,
 		ChunkSize:         1024 * 1024,
 		ReplicationFactor: 2,
 	}
@@ -41,37 +58,104 @@ func DefaultConig() Config {
 
 func NewLilioInstance(cfg Config) (*Lilio, error) {
 	// metadata store
-	metadataStore, err := metadata.NewMetadataStore(filepath.Join(cfg.BasePath, "metadata"))
+	var metadataStore metadata.MetadataStore
+	var err error
+
+	if cfg.MetadataConfig != nil {
+		// Use custom metadata config
+		metadataStore, err = metadata.NewStore(*cfg.MetadataConfig)
+	} else {
+		// Default to local store
+		metadataStore, err = metadata.NewStore(metadata.Config{
+			Type: metadata.StoreTypeLocal,
+			LocalConfig: &metadata.LocalConfig{
+				Path: cfg.BasePath + "/metadata",
+			},
+		})
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create metadata store: %w", err)
+		return nil, fmt.Errorf("failed to create metadata store: %w", err)
 	}
 
-	nodes := make(map[string]*StorageNode)
-	for i := 0; i < cfg.NumStorageNodes; i++ {
-		nodeId := fmt.Sprintf("node_%d", i)
-		nodePath := filepath.Join(cfg.BasePath, "storage_nodes", nodeId)
-		node, err := NewStorageNode(nodeId, nodePath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create storage node %s: %w", nodeId, err)
-		}
-
-		nodes[nodeId] = node
-	}
-
+	registry := NewRegistry()
+	hashRing := hashing.NewHashRing(150)
 	obj := &Lilio{
 		BasePath:          cfg.BasePath,
 		ChunkSize:         cfg.ChunkSize,
 		ReplicationFactor: cfg.ReplicationFactor,
-		StorageNodes:      nodes,
+		Registry:          registry,
+		FailedBackends:    make(map[string]*FailedBackend),
 		Metadata:          metadataStore,
+		HashRing:          hashRing,
+		encryptors:        make(map[string]*crypto.Encryptor),
 	}
 
-	fmt.Printf("MiniS3 initialized:\n")
-	fmt.Printf("  - Storage nodes: %d\n", cfg.NumStorageNodes)
+	fmt.Printf("Lilio initialized:\n")
 	fmt.Printf("  - Chunk size: %d KB\n", cfg.ChunkSize/1024)
 	fmt.Printf("  - Replication factor: %d\n", cfg.ReplicationFactor)
-
+	fmt.Printf("  - Using: Consistent Hashing\n")
 	return obj, nil
+}
+
+func (s *Lilio) AddBackend(backend StorageBackend) error {
+	err := s.Registry.Add(backend)
+	if err != nil {
+		return err
+	}
+
+	info := backend.Info()
+	s.HashRing.AddNode(info.Name)
+	return nil
+}
+
+// TrackFailedBackend records a backend that failed to initialize
+func (s *Lilio) TrackFailedBackend(name, backendType string, priority int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.FailedBackends[name] = &FailedBackend{
+		Name:     name,
+		Type:     backendType,
+		Priority: priority,
+		Error:    err.Error(),
+	}
+}
+
+// GetFailedBackends returns all backends that failed to initialize
+func (s *Lilio) GetFailedBackends() map[string]*FailedBackend {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make(map[string]*FailedBackend)
+	for k, v := range s.FailedBackends {
+		result[k] = v
+	}
+	return result
+}
+
+// 	s.HashRing.AddNode(backend.Info().Name)
+// 	return nil
+// }
+
+// RemoveBackend removes a storage backend
+func (s *Lilio) RemoveBackend(name string) error {
+	err := s.Registry.Remove(name)
+	if err != nil {
+		return err
+	}
+
+	s.HashRing.RemoveNode(name)
+	return nil
+}
+
+// ListBackends returns info about all backends
+func (s *Lilio) ListBackends() []BackendInfo {
+	var infos []BackendInfo
+	for _, backend := range s.Registry.List() {
+		infos = append(infos, backend.Info())
+	}
+	return infos
 }
 
 func (s *Lilio) ChunkData(data []byte) [][]byte {
@@ -84,30 +168,98 @@ func (s *Lilio) ChunkData(data []byte) [][]byte {
 	return chunks
 }
 
-func (s *Lilio) SelectNodesForChunk(chunkIndex int) []string {
+func (s *Lilio) SelectNodesForChunk(chunkId string) []StorageBackend {
 	// Get sorted node IDs for consistent selection
-	var nodeIDs []string
-	for id := range s.StorageNodes {
-		nodeIDs = append(nodeIDs, id)
+	if s.HashRing.IsEmpty() {
+		return nil
 	}
-	sort.Strings(nodeIDs)
+	nodeNames := s.HashRing.GetNodes(chunkId, s.ReplicationFactor)
 
-	numNodes := len(nodeIDs)
-	startPos := chunkIndex % numNodes
+	if len(nodeNames) == 0 {
+		return nil
+	}
 
-	var selected []string
-	for i := 0; i < s.ReplicationFactor && i < numNodes; i++ {
-		pos := (startPos + i) % numNodes
-		selected = append(selected, nodeIDs[pos])
+	var selected []StorageBackend
+	for _, name := range nodeNames {
+		backend, err := s.Registry.Get(name)
+		if err == nil && backend.Info().Status == StatusOnline {
+			selected = append(selected, backend)
+		}
 	}
 
 	return selected
+}
+
+func (s *Lilio) CreateBucketWithEncryption(bucketName, password string) error {
+	salt, err := crypto.GenerateSalt()
+	if err != nil {
+		return fmt.Errorf("failed to generate salt: %w", err)
+	}
+
+	enc, err := crypto.NewEncryptorFromPassword(password, salt)
+	if err != nil {
+		return fmt.Errorf("failed to create encryptor: %w", err)
+	}
+
+	s.encMu.Lock()
+	s.encryptors[bucketName] = enc
+	s.encMu.Unlock()
+
+	keyHash := sha256.Sum256([]byte(password))
+
+	encConfig := metadata.EncryptionConfig{
+		Enabled:   true,
+		Algorithm: "aes256-gcm",
+		Salt:      salt,
+		KeyHash:   hex.EncodeToString(keyHash[:]),
+	}
+
+	return s.Metadata.CreateBucketWithEncryption(bucketName, encConfig)
 }
 
 // Public API
 // Craete bucket
 func (s *Lilio) CreateBucket(bucketname string) error {
 	return s.Metadata.CreateBucket(bucketname)
+}
+
+func (s *Lilio) UnlockBucket(bucketName, password string) error {
+	encConfig, err := s.Metadata.GetBucketEncryption(bucketName)
+	if err != nil {
+		return err
+	}
+
+	if !encConfig.Enabled {
+		return fmt.Errorf("bucket is not encrypted")
+	}
+
+	keyHash := sha256.Sum256([]byte(password))
+	if hex.EncodeToString(keyHash[:]) != encConfig.KeyHash {
+		return fmt.Errorf("invalid password")
+	}
+
+	enc, err := crypto.NewEncryptorFromPassword(password, encConfig.Salt)
+	if err != nil {
+		return fmt.Errorf("failed to create encryptor: %w", err)
+	}
+
+	s.encMu.Lock()
+	s.encryptors[bucketName] = enc
+	s.encMu.Unlock()
+
+	return nil
+}
+
+func (s *Lilio) IsBucketUnlocked(bucketName string) bool {
+	s.encMu.RLock()
+	_, exists := s.encryptors[bucketName]
+	s.encMu.RUnlock()
+	return exists
+}
+func (s *Lilio) getEncryptor(bucketName string) *crypto.Encryptor {
+	s.encMu.RLock()
+	defer s.encMu.RUnlock()
+	return s.encryptors[bucketName]
 }
 
 // List buckets
@@ -119,85 +271,197 @@ func (s *Lilio) ListBuckets() ([]string, error) {
 
 // Put object
 
-func (s *Lilio) PutObject(bucket, key string, data []byte, contentType string) (*metadata.ObjectMetadata, error) {
+// func (s *Lilio) PutObjectOld(bucket, key string, data []byte, contentType string) (*metadata.ObjectMetadata, error) {
 
-	// TODO : Cond --> check if bucket exists
+// 	// TODO : Cond --> check if bucket exists
+
+// 	objectId := generateUUID()
+// 	chunks := s.ChunkData(data)
+// 	totalChunks := len(chunks)
+
+// 	fmt.Printf("\nPutting object: %s/%s\n", bucket, key)
+// 	fmt.Printf("  - Size: %d bytes\n", len(data))
+// 	fmt.Printf("  - Chunks: %d\n", totalChunks)
+
+// 	var chunkInfos []metadata.ChunkInfo
+// 	for i, chunkData := range chunks {
+// 		chunkId := fmt.Sprintf("%s_chunk_%d", objectId, i)
+
+// 		chunkCheckSum := CalculateChecksum(chunkData)
+// 		targetNodes := s.SelectNodesForChunk(i)
+// 		if len(targetNodes) == 0 {
+// 			return nil, fmt.Errorf("no healthy backends available")
+// 		}
+
+// 		var successfulNodes []string
+// 		var wg sync.WaitGroup
+// 		var mu sync.Mutex
+
+// 		for _, nodeId := range targetNodes {
+// 			wg.Add(1)
+// 			go func(b StorageBackend) {
+// 				defer wg.Done()
+
+// 				if err := b.StoreChunk(chunkId, chunkData); err == nil {
+// 					mu.Lock()
+// 					successfulNodes = append(successfulNodes, b.Info().Name)
+// 					mu.Unlock()
+// 				}
+// 			}(nodeId)
+// 		}
+
+// 		wg.Wait()
+// 		if len(successfulNodes) == 0 {
+// 			return nil, fmt.Errorf("failed to store chunk %d", i)
+// 		}
+
+// 		sort.Strings(successfulNodes)
+
+// 		chunkInfo := metadata.ChunkInfo{
+// 			ChunkID:      chunkId,
+// 			ChunkIndex:   i,
+// 			Size:         int64(len(chunkData)),
+// 			Checksum:     chunkCheckSum,
+// 			StorageNodes: successfulNodes,
+// 		}
+
+// 		chunkInfos = append(chunkInfos, chunkInfo)
+// 		fmt.Printf("Chunk %d: stored on %v\n", i, successfulNodes)
+// 	}
+
+// 	meta := &metadata.ObjectMetadata{
+// 		ObjectID:    objectId,
+// 		Bucket:      bucket,
+// 		Key:         key,
+// 		Size:        int64(len(data)),
+// 		Checksum:    CalculateChecksum(data),
+// 		ChunkSize:   s.ChunkSize,
+// 		TotalChunks: totalChunks,
+// 		Chunks:      chunkInfos,
+// 		CreatedAt:   time.Now().UTC(),
+// 		ContentType: contentType,
+// 	}
+
+// 	if err := s.Metadata.SaveObjectMetadata(meta); err != nil {
+// 		return nil, fmt.Errorf("failed to save metadata: %w", err)
+// 	}
+
+// 	fmt.Println("Object Stored successfully")
+// 	return meta, nil
+// }
+
+func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, contentType string) (*metadata.ObjectMetadata, error) {
+	if !s.Metadata.BucketExists(bucket) {
+		return nil, fmt.Errorf("bucket does not exist: %s", bucket)
+	}
+
+	isEncrypted, _ := s.Metadata.IsBucketEncrypted(bucket)
+	var encryptor *crypto.Encryptor
+
+	if isEncrypted {
+		encryptor = s.getEncryptor(bucket)
+		if encryptor == nil {
+			return nil, fmt.Errorf("bucket is encrypted but not unlocked. Use: lilio bucket unlock %s", bucket)
+		}
+	}
 
 	objectId := generateUUID()
-	chunks := s.ChunkData(data)
-	totalChunks := len(chunks)
+	fmt.Printf("\nPutting object (streaming): %s/%s\n", bucket, key)
+	fmt.Printf("  - Size: %d bytes\n", size)
+	if isEncrypted {
+		fmt.Printf("  - 🔐 Encryption: Enabled\n")
+	}
 
-	fmt.Printf("\nPutting object: %s/%s\n", bucket, key)
-	fmt.Printf("  - Size: %d bytes\n", len(data))
-	fmt.Printf("  - Chunks: %d\n", totalChunks)
-
+	chunkReader := utils.NewChunkReader(reader, s.ChunkSize)
 	var chunkInfos []metadata.ChunkInfo
-	for i, chunkData := range chunks {
-		chunkId := fmt.Sprintf("%s_chunk_%d", objectId, i)
+	var totalSize int64 = 0
+	var fullChecksum = sha256.New()
 
-		chunkCheckSum := CalculateChecksum(chunkData)
-		targetNodes := s.SelectNodesForChunk(i)
+	for {
+		chunkData, chunkIndex, err := chunkReader.NextChunk()
+		if err == io.EOF && chunkData == nil {
+			break // Done!
+		}
 
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read chunk %d: %w", chunkIndex, err)
+		}
+
+		// Update full file checksum
+		fullChecksum.Write(chunkData)
+		totalSize += int64(len(chunkData))
+
+		originalChunkSize := len(chunkData)
+		if encryptor != nil {
+			chunkData, err = encryptor.Encrypt(chunkData)
+			if err != nil {
+				return nil, fmt.Errorf("encryption failed for chunk %d: %w", chunkIndex, err)
+			}
+		}
+		// Generate chunk ID and checksum
+		chunkId := fmt.Sprintf("%s_chunk_%d", objectId, chunkIndex)
+		chunkChecksum := CalculateChecksum(chunkData)
+
+		// select the target nodes using consistent hashing
+		targetNodes := s.SelectNodesForChunk(chunkId)
+		if len(targetNodes) == 0 {
+			return nil, fmt.Errorf("no healthy backends available for chunk %d", chunkIndex)
+		}
+
+		// Store chunk on multiple nodes (parallel)
 		var successfulNodes []string
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 
-		for _, nodeId := range targetNodes {
+		for _, node := range targetNodes {
 			wg.Add(1)
-			go func(id string) {
+			go func(b StorageBackend) {
 				defer wg.Done()
-
-				s.mu.RLock()
-				node, exists := s.StorageNodes[id]
-				s.mu.RUnlock()
-
-				if !exists {
-					return
-				}
-
-				if err := node.StoreChunk(chunkId, chunkData); err == nil {
+				if err := b.StoreChunk(chunkId, chunkData); err == nil {
 					mu.Lock()
-					successfulNodes = append(successfulNodes, id)
+					successfulNodes = append(successfulNodes, b.Info().Name)
 					mu.Unlock()
 				}
-			}(nodeId)
+
+			}(node)
 		}
 
 		wg.Wait()
 		if len(successfulNodes) == 0 {
-			return nil, fmt.Errorf("failed to store chunk %d", i)
+			return nil, fmt.Errorf("failed to store chunk %d on any node", chunkIndex)
 		}
 
+		sort.Strings(successfulNodes)
 		chunkInfo := metadata.ChunkInfo{
 			ChunkID:      chunkId,
-			ChunkIndex:   i,
-			Size:         int64(len(chunkData)),
-			Checksum:     chunkCheckSum,
+			ChunkIndex:   chunkIndex,
+			Size:         int64(originalChunkSize),
+			Checksum:     chunkChecksum,
 			StorageNodes: successfulNodes,
 		}
-
 		chunkInfos = append(chunkInfos, chunkInfo)
-		fmt.Printf("Chunk %d: stored on %v\n", i, successfulNodes)
+		fmt.Printf("  ✓ Chunk %d: %d bytes → stored on %v\n", chunkIndex, originalChunkSize, successfulNodes)
 	}
 
 	meta := &metadata.ObjectMetadata{
 		ObjectID:    objectId,
 		Bucket:      bucket,
 		Key:         key,
-		Size:        int64(len(data)),
-		Checksum:    CalculateChecksum(data),
+		Size:        totalSize,
+		Checksum:    hex.EncodeToString(fullChecksum.Sum(nil)),
 		ChunkSize:   s.ChunkSize,
-		TotalChunks: totalChunks,
+		TotalChunks: len(chunkInfos),
 		Chunks:      chunkInfos,
 		CreatedAt:   time.Now().UTC(),
 		ContentType: contentType,
+		Encrypted:   isEncrypted,
 	}
 
 	if err := s.Metadata.SaveObjectMetadata(meta); err != nil {
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
-	fmt.Println("Object Stored successfully")
+	fmt.Println("  ✓ Object stored successfully!")
 	return meta, nil
 }
 
@@ -207,7 +471,7 @@ func generateUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-func (s *Lilio) GetObject(bucket, key string) ([]byte, error) {
+func (s *Lilio) GetObjectOld(bucket, key string) ([]byte, error) {
 
 	//  --------- flow ------------
 	// Fetch the metadata
@@ -242,16 +506,13 @@ func (s *Lilio) GetObject(bucket, key string) ([]byte, error) {
 		// try each node that has this chunk
 
 		for _, nodeId := range chunkInfo.StorageNodes {
-			s.mu.Lock()
-			node, exists := s.StorageNodes[nodeId]
-			s.mu.Unlock()
-
-			if !exists {
+			backend, err := s.Registry.Get(nodeId)
+			if err != nil {
 				fmt.Printf("  ⚠ Chunk %d: %s unavailable, trying next...\n", chunkInfo.ChunkIndex, nodeId)
 				continue
 			}
 
-			data, err := node.RetrieveChunk(chunkInfo.ChunkID)
+			data, err := backend.RetrieveChunk(chunkInfo.ChunkID)
 			if err != nil {
 				continue
 			}
@@ -283,6 +544,81 @@ func (s *Lilio) GetObject(bucket, key string) ([]byte, error) {
 	return fullData, nil
 }
 
+func (s *Lilio) GetObject(bucket, key string, writer io.Writer) error {
+	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
+	if err != nil {
+		return err
+	}
+
+	var encryptor *crypto.Encryptor
+	if meta.Encrypted {
+		encryptor = s.getEncryptor(bucket)
+		if encryptor == nil {
+			return fmt.Errorf("object is encrypted but bucket not unlocked. Use: lilio bucket unlock %s", bucket)
+		}
+	}
+
+	fmt.Printf("\nGetting object: %s/%s\n", bucket, key)
+	fmt.Printf("  - Size: %d bytes\n", meta.Size)
+	fmt.Printf("  - Chunks: %d\n", meta.TotalChunks)
+	if meta.Encrypted {
+		fmt.Printf("  - 🔐 Encrypted: Yes\n")
+	}
+
+	sort.Slice(meta.Chunks, func(i, j int) bool {
+		return meta.Chunks[i].ChunkIndex < meta.Chunks[j].ChunkIndex
+	})
+
+	// var chunksData [][]byte
+	for _, chunkInfo := range meta.Chunks {
+		chunkData, err := s.retrieveChunk(chunkInfo)
+		if err != nil {
+			return fmt.Errorf("failed to retrieve chunk %d: %w", chunkInfo.ChunkIndex, err)
+
+		}
+
+		if encryptor != nil {
+			chunkData, err = encryptor.Decrypt(chunkData)
+			if err != nil {
+				return fmt.Errorf("decryption failed for chunk %d: %w", chunkInfo.ChunkIndex, err)
+			}
+		}
+
+		_, err = writer.Write(chunkData)
+		if err != nil {
+			return fmt.Errorf("failed to write chunk %d: %w", chunkInfo.ChunkIndex, err)
+		}
+
+		fmt.Printf("  ✓ Chunk %d: streamed\n", chunkInfo.ChunkIndex)
+
+	}
+
+	fmt.Printf("  ✓ Object streamed successfully!\n")
+	return nil
+}
+
+func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
+	for _, nodeName := range chunkInfo.StorageNodes {
+		backend, err := s.Registry.Get(nodeName)
+		if err != nil {
+			continue // Try next node
+		}
+
+		data, err := backend.RetrieveChunk(chunkInfo.ChunkID)
+		if err != nil {
+			continue // Try next node
+		}
+
+		// Verify checksum
+		if CalculateChecksum(data) == chunkInfo.Checksum {
+			return data, nil
+		}
+		// Checksum mismatch, try next node
+	}
+
+	return nil, fmt.Errorf("chunk %s not available on any node", chunkInfo.ChunkID)
+}
+
 func (s *Lilio) HeadObject(bucket, key string) (*metadata.ObjectMetadata, error) {
 	return s.Metadata.GetObjectMetadata(bucket, key)
 }
@@ -295,13 +631,10 @@ func (s *Lilio) DeleteObject(bucket, key string) error {
 
 	// Delete all chunks
 	for _, chunkInfo := range meta.Chunks {
-		for _, nodeID := range chunkInfo.StorageNodes {
-			s.mu.RLock()
-			node, exists := s.StorageNodes[nodeID]
-			s.mu.RUnlock()
-
-			if exists {
-				node.DeleteChunk(chunkInfo.ChunkID)
+		for _, backendName := range chunkInfo.StorageNodes {
+			backend, err := s.Registry.Get(backendName)
+			if err == nil {
+				backend.DeleteChunk(chunkInfo.ChunkID)
 			}
 		}
 	}
@@ -315,12 +648,24 @@ func (s *Lilio) ListObjects(bucket, prefix string) ([]string, error) {
 
 // Storage stats
 func (s *Lilio) GetStorageStats() map[string]map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	stats := make(map[string]map[string]interface{})
-	for nodeID, node := range s.StorageNodes {
-		stats[nodeID] = node.GetStats()
+
+	for _, backend := range s.Registry.List() {
+		info := backend.Info()
+		backendStats, _ := backend.Stats()
+
+		stats[info.Name] = map[string]interface{}{
+			"node_id":       info.Name,
+			"path":          info.Type,
+			"status":        info.Status,
+			"chunks_stored": backendStats.ChunksStored,
+			"bytes_stored":  backendStats.BytesUsed,
+		}
 	}
+
 	return stats
+}
+
+func (s *Lilio) HealthCheck() map[string]error {
+	return s.Registry.HealthCheck()
 }
