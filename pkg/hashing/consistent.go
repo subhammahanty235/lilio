@@ -10,6 +10,7 @@ import (
 
 const (
 	DefaultvirtualNodes = 150
+	MaxCollisionRetries = 100
 )
 
 type HashRing struct {
@@ -50,9 +51,11 @@ func (hr *HashRing) AddNode(nodeName string) {
 	for i := 0; i < hr.virtualNodes; i++ {
 		virtualkey := fmt.Sprintf("%s#%d", nodeName, i)
 		position := hash(virtualkey)
-
-		for hr.positionToNode[position] != "" {
-			position++
+		retryCount := 0
+		for hr.positionToNode[position] != "" && retryCount < MaxCollisionRetries {
+			retryKey := fmt.Sprintf("%s#%d#retry%d", nodeName, i, retryCount)
+			position = hash(retryKey)
+			retryCount++
 		}
 
 		positions = append(positions, position)

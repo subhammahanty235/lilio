@@ -103,19 +103,29 @@ func initFromConfig(configPath string) (*storage.Lilio, error) {
 		backend, err := createBackend(storageCfg)
 		if err != nil {
 			fmt.Printf("  ⚠ Skipping %s: %v\n", storageCfg.Name, err)
+			// Track the failed backend
+			lio.TrackFailedBackend(storageCfg.Name, storageCfg.Type, storageCfg.Priority, err)
 			continue
 		}
 
 		if err := lio.AddBackend(backend); err != nil {
 			fmt.Printf("  ⚠ Failed to add %s: %v\n", storageCfg.Name, err)
+			// Track the failed backend
+			lio.TrackFailedBackend(storageCfg.Name, storageCfg.Type, storageCfg.Priority, err)
 			continue
 		}
 
 		fmt.Printf("  ✓ Added backend: %s (%s)\n", storageCfg.Name, storageCfg.Type)
 	}
 
-	if lio.Registry.Count() == 0 {
+	// Allow server to start even if all backends failed (show them in dashboard)
+	totalBackends := lio.Registry.Count() + len(lio.FailedBackends)
+	if totalBackends == 0 {
 		return nil, fmt.Errorf("no storage backends configured")
+	}
+
+	if lio.Registry.Count() == 0 {
+		fmt.Println("  ⚠ Warning: No healthy backends available. Server running in degraded mode.")
 	}
 
 	return lio, nil

@@ -18,6 +18,8 @@ func main() {
 	switch command {
 	case "server":
 		runServer()
+	case "web":
+		handleWeb()
 	case "storage":
 		handleStorage()
 	case "put":
@@ -55,7 +57,8 @@ Usage: lilio <command> [options]
 Commands:
   init                        Initialize config file
   server                      Start the HTTP API server
-  
+  web                         Open web interface in browser
+
   storage add <type> [opts]   Add a storage backend
   storage remove <name>       Remove a storage backend
   storage list                List all storage backends
