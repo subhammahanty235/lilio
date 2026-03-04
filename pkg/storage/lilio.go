@@ -14,8 +14,25 @@ import (
 	"github.com/subhammahanty235/lilio/pkg/crypto"
 	"github.com/subhammahanty235/lilio/pkg/hashing"
 	"github.com/subhammahanty235/lilio/pkg/metadata"
+	"github.com/subhammahanty235/lilio/pkg/metrics"
 	"github.com/subhammahanty235/lilio/pkg/utils"
 )
+
+type QuorumConfig struct {
+	N int
+	R int
+	W int
+}
+
+func DefaultQuorum(rf int) QuorumConfig {
+	quorum := (rf / 2) + 1
+	return QuorumConfig{
+		N: rf,
+		R: quorum,
+		W: quorum,
+	}
+
+}
 
 type FailedBackend struct {
 	Name     string
@@ -35,10 +52,11 @@ type Lilio struct {
 	Metadata       metadata.MetadataStore
 	HashRing       *hashing.HashRing
 
+	Metrics    metrics.Collector
 	encryptors map[string]*crypto.Encryptor
 	encMu      sync.RWMutex
-
-	mu sync.RWMutex
+	Quorum     QuorumConfig
+	mu         sync.RWMutex
 }
 
 type Config struct {
@@ -46,13 +64,15 @@ type Config struct {
 	ChunkSize         int
 	ReplicationFactor int
 	MetadataConfig    *metadata.Config
+	MetricsConfig     *metrics.Config
+	Quorum            *QuorumConfig //custom quorum settings
 }
 
 func DefaultConig() Config {
 	return Config{
 		BasePath:          "./lilio_data",
 		ChunkSize:         1024 * 1024,
-		ReplicationFactor: 2,
+		ReplicationFactor: 3,
 	}
 }
 
@@ -78,6 +98,26 @@ func NewLilioInstance(cfg Config) (*Lilio, error) {
 		return nil, fmt.Errorf("failed to create metadata store: %w", err)
 	}
 
+	var quorum QuorumConfig
+	if cfg.Quorum != nil {
+		quorum = *cfg.Quorum
+		if quorum.W+quorum.R <= quorum.N {
+			return nil, fmt.Errorf("invalid quorum: W(%d) + R(%d) must be > N(%d)", quorum.W, quorum.R, quorum.N)
+		}
+	} else {
+		quorum = DefaultQuorum(cfg.ReplicationFactor)
+	}
+
+	var metricsCollector metrics.Collector
+	if cfg.MetricsConfig != nil {
+		metricsCollector, err = metrics.NewCollector(*cfg.MetricsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create metrics collector: %w", err)
+		}
+	} else {
+		metricsCollector, _ = metrics.NewCollector(metrics.DefaultConfig())
+	}
+
 	registry := NewRegistry()
 	hashRing := hashing.NewHashRing(150)
 	obj := &Lilio{
@@ -88,13 +128,16 @@ func NewLilioInstance(cfg Config) (*Lilio, error) {
 		FailedBackends:    make(map[string]*FailedBackend),
 		Metadata:          metadataStore,
 		HashRing:          hashRing,
+		Metrics:           metricsCollector,
+		Quorum:            quorum,
 		encryptors:        make(map[string]*crypto.Encryptor),
 	}
 
 	fmt.Printf("Lilio initialized:\n")
 	fmt.Printf("  - Chunk size: %d KB\n", cfg.ChunkSize/1024)
-	fmt.Printf("  - Replication factor: %d\n", cfg.ReplicationFactor)
+	fmt.Printf("  - Replication: N=%d, W=%d, R=%d\n", quorum.N, quorum.W, quorum.R)
 	fmt.Printf("  - Using: Consistent Hashing\n")
+	fmt.Printf("  - Metrics: %s\n", metricsCollector.Type())
 	return obj, nil
 }
 
@@ -355,6 +398,7 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 		return nil, fmt.Errorf("bucket does not exist: %s", bucket)
 	}
 
+	startTime := time.Now()
 	isEncrypted, _ := s.Metadata.IsBucketEncrypted(bucket)
 	var encryptor *crypto.Encryptor
 
@@ -413,6 +457,8 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 
+		version := time.Now().UnixNano()
+
 		for _, node := range targetNodes {
 			wg.Add(1)
 			go func(b StorageBackend) {
@@ -427,8 +473,9 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 		}
 
 		wg.Wait()
-		if len(successfulNodes) == 0 {
-			return nil, fmt.Errorf("failed to store chunk %d on any node", chunkIndex)
+		if len(successfulNodes) < s.Quorum.W {
+			return nil, fmt.Errorf("write quorum failed for chunk %d: got %d/%d nodes",
+				chunkIndex, len(successfulNodes), s.Quorum.W)
 		}
 
 		sort.Strings(successfulNodes)
@@ -438,9 +485,14 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 			Size:         int64(originalChunkSize),
 			Checksum:     chunkChecksum,
 			StorageNodes: successfulNodes,
+			Version:      version,
 		}
 		chunkInfos = append(chunkInfos, chunkInfo)
 		fmt.Printf("  ✓ Chunk %d: %d bytes → stored on %v\n", chunkIndex, originalChunkSize, successfulNodes)
+
+		for _, nodename := range successfulNodes {
+			s.Metrics.RecordChunkStored(nodename, int64(originalChunkSize))
+		}
 	}
 
 	meta := &metadata.ObjectMetadata{
@@ -460,7 +512,7 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 	if err := s.Metadata.SaveObjectMetadata(meta); err != nil {
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
-
+	s.Metrics.RecordPutObject(bucket, totalSize, time.Since(startTime))
 	fmt.Println("  ✓ Object stored successfully!")
 	return meta, nil
 }
@@ -489,7 +541,7 @@ func (s *Lilio) GetObjectOld(bucket, key string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	startTime := time.Now()
 	fmt.Printf("\nGetting object: %s/%s\n", bucket, key)
 	fmt.Printf("  - Size: %d bytes\n", meta.Size)
 	fmt.Printf("  - Chunks: %d\n", meta.TotalChunks)
@@ -538,6 +590,7 @@ func (s *Lilio) GetObjectOld(bucket, key string) ([]byte, error) {
 	if CalculateChecksum(fullData) != meta.Checksum {
 		return nil, fmt.Errorf("final checksum verification failed")
 	}
+	s.Metrics.RecordGetObject(bucket, meta.Size, time.Since(startTime))
 
 	fmt.Printf("  ✓ Object retrieved successfully!\n")
 
@@ -597,26 +650,81 @@ func (s *Lilio) GetObject(bucket, key string, writer io.Writer) error {
 	return nil
 }
 
+type ChunkResponse struct {
+	Data     []byte
+	Checksum string
+	NodeName string
+	Valid    bool
+}
+
 func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
+	var response []ChunkResponse
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for _, nodeName := range chunkInfo.StorageNodes {
-		backend, err := s.Registry.Get(nodeName)
-		if err != nil {
-			continue // Try next node
-		}
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			backend, err := s.Registry.Get(name)
+			if err != nil {
+				return
+			}
+			data, err := backend.RetrieveChunk(chunkInfo.ChunkID)
+			if err != nil {
+				return
+			}
 
-		data, err := backend.RetrieveChunk(chunkInfo.ChunkID)
-		if err != nil {
-			continue // Try next node
-		}
+			checksum := CalculateChecksum(data)
+			valid := checksum == chunkInfo.Checksum
+			mu.Lock()
+			response = append(response, ChunkResponse{
+				Data:     data,
+				Checksum: checksum,
+				NodeName: name,
+				Valid:    valid,
+			})
+			mu.Unlock()
+		}(nodeName)
+	}
+	wg.Wait()
 
-		// Verify checksum
-		if CalculateChecksum(data) == chunkInfo.Checksum {
-			return data, nil
-		}
-		// Checksum mismatch, try next node
+	if len(response) < s.Quorum.R {
+		return nil, fmt.Errorf("read quorum failed: got %d/%d nodes", len(response), s.Quorum.R)
 	}
 
-	return nil, fmt.Errorf("chunk %s not available on any node", chunkInfo.ChunkID)
+	var validResponses []ChunkResponse
+	var staleNodes []string
+	for _, resp := range response {
+		if resp.Valid {
+			validResponses = append(validResponses, resp)
+		} else {
+			staleNodes = append(staleNodes, resp.NodeName)
+		}
+	}
+	if len(validResponses) == 0 {
+		return nil, fmt.Errorf("no valid chunk data found (all checksums failed)")
+	}
+	if len(staleNodes) > 0 {
+		go s.readRepair(chunkInfo.ChunkID, validResponses[0].Data, staleNodes)
+	}
+	fmt.Printf("    Quorum R=%d/%d, valid=%d, repaired=%d\n",
+		len(response), s.Quorum.R, len(validResponses), len(staleNodes))
+
+	return validResponses[0].Data, nil
+}
+
+func (s *Lilio) readRepair(chunkId string, data []byte, staleNodes []string) {
+	for _, nodeName := range staleNodes {
+		backend, err := s.Registry.Get(nodeName)
+		if err != nil {
+			continue
+		}
+
+		if err := backend.StoreChunk(chunkId, data); err == nil {
+			fmt.Printf("    🔧 Read repair: fixed %s on %s\n", chunkId, nodeName)
+		}
+	}
 }
 
 func (s *Lilio) HeadObject(bucket, key string) (*metadata.ObjectMetadata, error) {
