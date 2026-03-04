@@ -473,7 +473,12 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 		}
 
 		wg.Wait()
-		if len(successfulNodes) < s.Quorum.W {
+
+		// Record quorum write metrics
+		success := len(successfulNodes) >= s.Quorum.W
+		s.Metrics.RecordQuorumWrite(success, len(targetNodes), len(successfulNodes))
+
+		if !success {
 			return nil, fmt.Errorf("write quorum failed for chunk %d: got %d/%d nodes",
 				chunkIndex, len(successfulNodes), s.Quorum.W)
 		}
@@ -675,6 +680,9 @@ func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
 				return
 			}
 
+			// Record chunk retrieval
+			s.Metrics.RecordChunkRetrieved(name, int64(len(data)))
+
 			checksum := CalculateChecksum(data)
 			valid := checksum == chunkInfo.Checksum
 			mu.Lock()
@@ -689,7 +697,11 @@ func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
 	}
 	wg.Wait()
 
-	if len(response) < s.Quorum.R {
+	// Record quorum read metrics
+	success := len(response) >= s.Quorum.R
+	s.Metrics.RecordQuorumRead(success, len(chunkInfo.StorageNodes), len(response))
+
+	if !success {
 		return nil, fmt.Errorf("read quorum failed: got %d/%d nodes", len(response), s.Quorum.R)
 	}
 
@@ -723,6 +735,7 @@ func (s *Lilio) readRepair(chunkId string, data []byte, staleNodes []string) {
 
 		if err := backend.StoreChunk(chunkId, data); err == nil {
 			fmt.Printf("    🔧 Read repair: fixed %s on %s\n", chunkId, nodeName)
+			s.Metrics.RecordReadRepair(nodeName)
 		}
 	}
 }
@@ -743,11 +756,17 @@ func (s *Lilio) DeleteObject(bucket, key string) error {
 			backend, err := s.Registry.Get(backendName)
 			if err == nil {
 				backend.DeleteChunk(chunkInfo.ChunkID)
+				s.Metrics.RecordChunkDeleted(backendName)
 			}
 		}
 	}
 
-	return s.Metadata.DeleteObjectMetadata(bucket, key)
+	err = s.Metadata.DeleteObjectMetadata(bucket, key)
+	if err == nil {
+		s.Metrics.RecordDeleteObject(bucket)
+	}
+
+	return err
 }
 
 func (s *Lilio) ListObjects(bucket, prefix string) ([]string, error) {
@@ -775,5 +794,13 @@ func (s *Lilio) GetStorageStats() map[string]map[string]interface{} {
 }
 
 func (s *Lilio) HealthCheck() map[string]error {
-	return s.Registry.HealthCheck()
+	healthStatus := s.Registry.HealthCheck()
+
+	// Record backend health metrics
+	for nodeName, err := range healthStatus {
+		healthy := err == nil
+		s.Metrics.RecordBackendHealth(nodeName, healthy)
+	}
+
+	return healthStatus
 }
