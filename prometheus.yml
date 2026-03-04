@@ -1,0 +1,25 @@
+# prometheus.yml
+# Prometheus configuration for Lilio
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Lilio server metrics
+  # Note: host.docker.internal points to your host machine from inside Docker
+  - job_name: 'lilio'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+    metrics_path: /metrics
+    scrape_interval: 5s
+
+  # etcd metrics (optional)
+  - job_name: 'etcd'
+    static_configs:
+      - targets: ['etcd:2379']

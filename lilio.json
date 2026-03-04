@@ -5,29 +5,33 @@
     "metadata_path": "./lilio_data/metadata",
     "api_port": 8080
   },
+    "metrics": {
+      "enabled": true,
+      "type": "prometheus"
+    },
   "storages": [
     {
-      "name": "local-ssd",
+      "name": "local-1",
       "type": "local",
       "priority": 1,
       "options": {
-        "path": "./lilio_data/storage_nodes/local-ssd"
+        "path": "./lilio_data/storage/local-1"
       }
     },
     {
-      "name": "local-hdd",
+      "name": "local-3",
       "type": "local",
-      "priority": 2,
+      "priority": 3,
       "options": {
-        "path": "./lilio_data/storage_nodes/local-hdd"
+        "path": "./lilio_data/storage/local-3"
       }
     },
     {
-      "name": "disk1",
-      "type": "local",
+      "name": "gdrive-1",
+      "type": "gdrive",
       "priority": 10,
       "options": {
-        "path": "./lilio_data/storage_nodes/local-hdd2"
+        "credentials": "./lilio-drive-1-primarykey.json"
       }
     }
   ]
