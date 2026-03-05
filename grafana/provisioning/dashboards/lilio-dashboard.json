@@ -1,0 +1,99 @@
+{
+    "annotations": {
+      "list": []
+    },
+    "title": "Lilio Storage Dashboard",
+    "uid": "lilio-main",
+    "version": 1,
+    "panels": [
+      {
+        "title": "Object Operations (Rate)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [
+          {
+            "expr": "rate(lilio_objects_total[5m])",
+            "legendFormat": "{{bucket}} - {{operation}}"
+          }
+        ]
+      },
+      {
+        "title": "Request Duration (p95)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(lilio_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{bucket}} - {{operation}}"
+          }
+        ]
+      },
+      {
+        "title": "Chunks Stored (by Node)",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+        "targets": [
+          {
+            "expr": "rate(lilio_chunks_stored_total[5m])",
+            "legendFormat": "{{node}}"
+          }
+        ]
+      },
+      {
+        "title": "Quorum Success Rate",
+        "type": "gauge",
+        "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+        "targets": [
+          {
+            "expr": "sum(lilio_quorum_write_total{success=\"true\"}) / sum(lilio_quorum_write_total) * 100",
+            "legendFormat": "Write Success %"
+          }
+        ],
+        "options": {
+          "minValue": 0,
+          "maxValue": 100
+        }
+      },
+      {
+        "title": "Read Repairs",
+        "type": "stat",
+        "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+        "targets": [
+          {
+            "expr": "sum(lilio_read_repairs_total)",
+            "legendFormat": "Total Repairs"
+          }
+        ]
+      },
+      {
+        "title": "Backend Health",
+        "type": "table",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+        "targets": [
+          {
+            "expr": "lilio_backend_health",
+            "legendFormat": "{{node}}",
+            "format": "table",
+            "instant": true
+          }
+        ]
+      },
+      {
+        "title": "Object Size Distribution",
+        "type": "histogram",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+        "targets": [
+          {
+            "expr": "lilio_object_size_bytes_bucket",
+            "legendFormat": "{{le}}"
+          }
+        ]
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "5s",
+    "schemaVersion": 38
+  }

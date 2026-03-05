@@ -66,6 +66,7 @@ type ChunkInfo struct {
 	Size         int64    `json:"size"`
 	Checksum     string   `json:"checksum"`
 	StorageNodes []string `json:"storage_nodes"`
+	Version      int64    `json:"version"`
 }
 
 type ObjectMetadata struct {

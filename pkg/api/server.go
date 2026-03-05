@@ -316,6 +316,13 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/ui", web.ServeUI)
 	mux.HandleFunc("/ui/", web.ServeUI)
 
+	// Add metrics endpoint
+	if metricsHandler := s.lio.Metrics.Handler(); metricsHandler != nil {
+		if handler, ok := metricsHandler.(http.Handler); ok {
+			mux.Handle("/metrics", handler)
+		}
+	}
+
 	fmt.Printf(`
 ╔════════════════════════════════════════════════════════════╗
 ║              Mini S3 HTTP API Server (Go)                  ║
@@ -324,6 +331,9 @@ func (s *Server) Start() error {
 ║                                                            ║
 ║  Web Interface:                                            ║
 ║    http://%s/ui                - Web UI                    ║
+║                                                            ║
+║  Metrics (%s):                                             ║
+║    http://%s/metrics           - Prometheus metrics        ║
 ║                                                            ║
 ║  API Endpoints:                                            ║
 ║    GET    /                    - List buckets              ║
@@ -340,7 +350,7 @@ func (s *Server) Start() error {
 ║                                                            ║
 ║  Press Ctrl+C to stop                                      ║
 ╚════════════════════════════════════════════════════════════╝
-`, s.addr, s.addr)
+`, s.addr, s.addr, s.lio.Metrics.Type(), s.addr)
 	log.Printf("Starting server on %s", s.addr)
 	return http.ListenAndServe(s.addr, mux)
 }
