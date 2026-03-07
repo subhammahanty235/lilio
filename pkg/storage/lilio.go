@@ -603,6 +603,7 @@ func (s *Lilio) GetObjectOld(bucket, key string) ([]byte, error) {
 }
 
 func (s *Lilio) GetObject(bucket, key string, writer io.Writer) error {
+	startTime := time.Now()
 	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
 	if err != nil {
 		return err
@@ -650,7 +651,7 @@ func (s *Lilio) GetObject(bucket, key string, writer io.Writer) error {
 		fmt.Printf("  ✓ Chunk %d: streamed\n", chunkInfo.ChunkIndex)
 
 	}
-
+	s.Metrics.RecordGetObject(bucket, meta.Size, time.Since(startTime))
 	fmt.Printf("  ✓ Object streamed successfully!\n")
 	return nil
 }
