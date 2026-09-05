@@ -1279,6 +1279,11 @@ MIT License - see [LICENSE](LICENSE) file for details.
 - **Kubernetes** - etcd usage patterns
 - **Amazon S3** - API design
 
+## 📞 Contact & Support
+
+- **Issues:** [GitHub Issues](https://github.com/subhammahanty235/lilio/issues)
+- **Email:** subhammahanty235@gmail.com
+
 ---
 
 **Built with ❤️ in Go**
