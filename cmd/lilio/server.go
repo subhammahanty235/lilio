@@ -8,6 +8,8 @@ import (
 
 	"github.com/subhammahanty235/lilio/pkg/api"
 	"github.com/subhammahanty235/lilio/pkg/config"
+	"github.com/subhammahanty235/lilio/pkg/metadata"
+	"github.com/subhammahanty235/lilio/pkg/metrics"
 	"github.com/subhammahanty235/lilio/pkg/storage"
 	storagemodels "github.com/subhammahanty235/lilio/pkg/storage/storage-models"
 )
@@ -86,11 +88,19 @@ func initFromConfig(configPath string) (*storage.Lilio, error) {
 		return nil, fmt.Errorf("invalid chunk size: %w", err)
 	}
 
+	metadataCfg, err := metadataConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create Lilio instance
 	storageCfg := storage.Config{
 		BasePath:          cfg.Lilio.MetadataPath,
 		ChunkSize:         chunkSize,
 		ReplicationFactor: cfg.Lilio.ReplicationFactor,
+		MetadataConfig:    &metadataCfg,
+		MetricsConfig:     metricsConfig(cfg),
+		Quorum:            quorumConfig(cfg),
 	}
 
 	lio, err := storage.NewLilioInstance(storageCfg)
@@ -161,4 +171,80 @@ func createBackend(cfg config.StorageConfig) (storage.StorageBackend, error) {
 		return nil, fmt.Errorf("unknown backend type: %s", cfg.Type)
 	}
 
+}
+
+// metadataConfig translates the file's metadata section into the storage core's
+// configuration.
+//
+// It is always returned non-nil, which also settles where local metadata lives:
+// the core appends "/metadata" to BasePath when no metadata config is supplied,
+// so a metadata_path of "./lilio_data/metadata" used to land the files in
+// "./lilio_data/metadata/metadata".
+func metadataConfig(cfg *config.Config) (metadata.Config, error) {
+	path := cfg.Lilio.MetadataPath
+	if path == "" {
+		path = "./lilio_data/metadata"
+	}
+
+	m := cfg.Metadata
+	if m == nil || m.Type == "" || m.Type == "local" {
+		if m != nil && m.Local != nil && m.Local.Path != "" {
+			path = m.Local.Path
+		}
+		return metadata.Config{
+			Type:        metadata.StoreTypeLocal,
+			LocalConfig: &metadata.LocalConfig{Path: path},
+		}, nil
+	}
+
+	switch m.Type {
+	case "memory":
+		return metadata.Config{Type: metadata.StoreTypeMemory}, nil
+
+	case "etcd":
+		timeout, err := m.Etcd.DialTimeoutDuration()
+		if err != nil {
+			return metadata.Config{}, fmt.Errorf("invalid metadata etcd.dial_timeout: %w", err)
+		}
+		return metadata.Config{
+			Type: metadata.StoreTypeEtcd,
+			EtcdConfig: &metadata.EtcdConfig{
+				Endpoints:   m.Etcd.Endpoints,
+				Prefix:      m.Etcd.Prefix,
+				DialTimeout: timeout,
+				Username:    m.Etcd.Username,
+				Password:    m.Etcd.Password,
+			},
+		}, nil
+
+	default:
+		return metadata.Config{}, fmt.Errorf("unknown metadata type: %s", m.Type)
+	}
+}
+
+// metricsConfig translates the file's metrics section. Returning nil leaves the
+// core on its default, which is Prometheus enabled.
+func metricsConfig(cfg *config.Config) *metrics.Config {
+	if cfg.Metrics == nil {
+		return nil
+	}
+	return &metrics.Config{
+		Enabled: cfg.Metrics.Enabled,
+		Type:    metrics.MetricType(cfg.Metrics.Type),
+		Path:    cfg.Metrics.Path,
+	}
+}
+
+// quorumConfig translates the file's quorum section. Returning nil leaves the
+// core to derive a majority W and R from the replication factor.
+func quorumConfig(cfg *config.Config) *storage.QuorumConfig {
+	q := cfg.Lilio.Quorum
+	if q == nil {
+		return nil
+	}
+	return &storage.QuorumConfig{
+		N: q.EffectiveN(cfg.Lilio.ReplicationFactor),
+		W: q.W,
+		R: q.R,
+	}
 }

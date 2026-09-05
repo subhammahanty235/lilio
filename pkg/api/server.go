@@ -2,11 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/subhammahanty235/lilio/pkg/metadata"
 	"github.com/subhammahanty235/lilio/pkg/storage"
 	"github.com/subhammahanty235/lilio/pkg/web"
 )
@@ -31,6 +34,71 @@ func jsonResponse(w http.ResponseWriter, status int, data interface{}) {
 
 func errorResponse(w http.ResponseWriter, status int, message string) {
 	jsonResponse(w, status, map[string]string{"error": message})
+}
+
+// writeObjectError maps a storage error onto an HTTP status.
+//
+// Telling absence apart from failure matters to the client: a 404 means the
+// object is not there and the request should not be repeated, a 500 means
+// something broke and a retry may well succeed. This handler previously
+// returned 404 for every error, including an unreachable metadata backend.
+func writeObjectError(w http.ResponseWriter, err error) {
+	// Discard any object headers staged before the failure became known.
+	w.Header().Del("Content-Length")
+	w.Header().Del("ETag")
+	w.Header().Del("Last-Modified")
+
+	switch {
+	case errors.Is(err, metadata.ErrObjectNotFound), errors.Is(err, metadata.ErrBucketNotFound):
+		errorResponse(w, http.StatusNotFound, err.Error())
+	default:
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+// setObjectHeaders stages the response headers describing an object. They are
+// not sent until something calls WriteHeader, which lets a caller stage them
+// and still change its mind.
+func setObjectHeaders(w http.ResponseWriter, meta *metadata.ObjectMetadata) {
+	contentType := meta.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+	w.Header().Set("ETag", `"`+meta.Checksum+`"`)
+	w.Header().Set("Last-Modified", meta.CreatedAt.UTC().Format(http.TimeFormat))
+}
+
+// deferredWriter holds back the response status line until the handler actually
+// produces a byte of body.
+//
+// A streaming read cannot know it will succeed before it starts: an object's
+// metadata can be perfectly readable while its chunks are not. Sending the
+// status eagerly makes that failure unreportable, which is how a read that
+// recovered nothing could still answer "200 OK" with an empty body. Deferring
+// the status keeps a real error code available for as long as nothing has been
+// sent, and makes it explicit at the point of failure that the choice is gone.
+type deferredWriter struct {
+	w       http.ResponseWriter
+	status  int
+	n       int64
+	written bool
+}
+
+func (d *deferredWriter) Write(p []byte) (int, error) {
+	d.commit()
+	n, err := d.w.Write(p)
+	d.n += int64(n)
+	return n, err
+}
+
+// commit sends the status line if it has not gone out already.
+func (d *deferredWriter) commit() {
+	if !d.written {
+		d.written = true
+		d.w.WriteHeader(d.status)
+	}
 }
 
 func parsePath(path string) (bucket, key string) {
@@ -266,16 +334,17 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, bucket str
 func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	switch r.Method {
 	case http.MethodPut:
+		defer r.Body.Close()
+
 		contentType := r.Header.Get("Content-Type")
 		if contentType == "" {
 			contentType = "application/octet-stream"
 		}
 		meta, err := s.lio.PutObject(bucket, key, r.Body, r.ContentLength, contentType)
 		if err != nil {
-			errorResponse(w, http.StatusInternalServerError, err.Error())
+			writeObjectError(w, err)
 			return
 		}
-		defer r.Body.Close()
 
 		jsonResponse(w, http.StatusCreated, map[string]interface{}{
 			"message":  "Object stored",
@@ -286,31 +355,65 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		})
 
 	case http.MethodGet:
-		metadata, err := s.lio.HeadObject(bucket, key)
+		meta, err := s.lio.HeadObject(bucket, key)
 		if err != nil {
-			errorResponse(w, http.StatusNotFound, err.Error())
+			writeObjectError(w, err)
 			return
 		}
+		setObjectHeaders(w, meta)
 
-		contentType := "application/octet-stream"
-		if metadata != nil && metadata.ContentType != "" {
-			contentType = metadata.ContentType
+		body := &deferredWriter{w: w, status: http.StatusOK}
+		if err := s.lio.GetObject(bucket, key, body); err != nil {
+			if !body.written {
+				// Nothing has reached the client yet, so the failure can still
+				// be reported as a status code.
+				writeObjectError(w, err)
+				return
+			}
+			// The status line is already on the wire and cannot be withdrawn.
+			// Breaking the connection is the only honest signal left: the
+			// client then sees a failed transfer rather than a truncated body
+			// that looks like a complete one. ErrAbortHandler aborts without
+			// logging a panic trace.
+			log.Printf("Error streaming object %s/%s after %d of %d bytes: %v",
+				bucket, key, body.n, meta.Size, err)
+			panic(http.ErrAbortHandler)
 		}
+		// A zero-byte object never triggers a Write, so it still needs a status.
+		body.commit()
 
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.Size))
+	case http.MethodHead:
+		meta, err := s.lio.HeadObject(bucket, key)
+		if err != nil {
+			writeObjectError(w, err)
+			return
+		}
+		// net/http discards any body written in response to a HEAD, so only
+		// these headers reach the client. No storage backend is touched.
+		setObjectHeaders(w, meta)
 		w.WriteHeader(http.StatusOK)
 
-		// Stream directly to response writer
-		if err := s.lio.GetObject(bucket, key, w); err != nil {
-			// Can't send error response here, headers already sent
-			log.Printf("Error streaming object: %v", err)
+	case http.MethodDelete:
+		if err := s.lio.DeleteObject(bucket, key); err != nil {
+			writeObjectError(w, err)
+			return
 		}
-	}
+		// 204: succeeded, nothing to return. Deleting an object that was
+		// already gone also reports success - see Lilio.DeleteObject on why
+		// DELETE has to be idempotent.
+		w.WriteHeader(http.StatusNoContent)
 
+	default:
+		// Without this, an unhandled method fell through the switch and
+		// net/http answered 200 with an empty body - which is how DELETE
+		// appeared to succeed while doing nothing at all.
+		errorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
-func (s *Server) Start() error {
+// Handler builds the server's HTTP routing. Start serves it; tests exercise it
+// directly without binding a port.
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/ui", web.ServeUI)
@@ -322,6 +425,12 @@ func (s *Server) Start() error {
 			mux.Handle("/metrics", handler)
 		}
 	}
+
+	return mux
+}
+
+func (s *Server) Start() error {
+	handler := s.Handler()
 
 	fmt.Printf(`
 ╔════════════════════════════════════════════════════════════╗
@@ -352,5 +461,5 @@ func (s *Server) Start() error {
 ╚════════════════════════════════════════════════════════════╝
 `, s.addr, s.addr, s.lio.Metrics.Type(), s.addr)
 	log.Printf("Starting server on %s", s.addr)
-	return http.ListenAndServe(s.addr, mux)
+	return http.ListenAndServe(s.addr, handler)
 }

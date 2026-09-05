@@ -1,7 +1,9 @@
 package metadata
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -334,12 +336,144 @@ func (s *MetadataStoreTestSuite) TestHealth() {
 	t.Logf("✓ Health check passed for %s backend", store.Type())
 }
 
+// TestKeyEncoding checks that distinct object keys stay distinct, and that a
+// key survives a save/list round trip unchanged.
+//
+// This is the case the rest of the suite missed: MemoryStore uses the key
+// directly as a map key and so was always correct, while LocalStore mapped
+// "/" to "_" in a filename and EtcdStore mapped "/" to ":" in its etcd key.
+// Both substitutions are many-to-one, so "a_b" and "a/b" (or "a:b") landed in
+// the same slot and writing one destroyed the other - silently, with no error
+// on either write.
+func (s *MetadataStoreTestSuite) TestKeyEncoding() {
+	t := s.t
+	store := s.Store
+
+	const bucket = "key-encoding-bucket"
+	if err := store.CreateBucket(bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
+
+	keys := []string{
+		"a_b.txt",                        // collided with "a/b.txt" under the local store
+		"a/b.txt",                        //
+		"a:b.txt",                        // collided with "a/b.txt" under the etcd store
+		"logs/2024/01/app.log",           // deeply nested
+		"file with spaces.txt",           //
+		"unicode-\u65e5\u672c\u8a9e.txt", //
+		"../escape.txt",                  // must not escape the metadata directory
+		"trailing/",                      // separator in final position
+		"UPPER.txt",                      // distinct from "upper.txt" on a case-
+		"upper.txt",                      //   insensitive filesystem
+		strings.Repeat("x", 300),         // longer than a filesystem name limit
+	}
+
+	// Give every key a distinguishable payload so aliasing shows up as one
+	// key returning another key's metadata.
+	for i, key := range keys {
+		meta := &ObjectMetadata{
+			ObjectID: fmt.Sprintf("obj-%d", i),
+			Bucket:   bucket,
+			Key:      key,
+			Size:     int64(i + 1),
+		}
+		if err := store.SaveObjectMetadata(meta); err != nil {
+			t.Fatalf("Failed to save key %q: %v", key, err)
+		}
+	}
+
+	// Every key must read back its own metadata.
+	for i, key := range keys {
+		got, err := store.GetObjectMetadata(bucket, key)
+		if err != nil {
+			t.Errorf("Failed to get key %q: %v", key, err)
+			continue
+		}
+		if got.Key != key {
+			t.Errorf("Key %q read back as %q", key, got.Key)
+		}
+		if got.ObjectID != fmt.Sprintf("obj-%d", i) {
+			t.Errorf("Key %q aliased onto another object: got ObjectID %q, want obj-%d",
+				key, got.ObjectID, i)
+		}
+	}
+
+	// Listing must return every key verbatim, with nothing invented or lost.
+	listed, err := store.ListObjects(bucket, "")
+	if err != nil {
+		t.Fatalf("Failed to list objects: %v", err)
+	}
+	if len(listed) != len(keys) {
+		t.Errorf("Expected %d objects, got %d: %v", len(keys), len(listed), listed)
+	}
+	seen := make(map[string]bool, len(listed))
+	for _, k := range listed {
+		seen[k] = true
+	}
+	for _, key := range keys {
+		if !seen[key] {
+			t.Errorf("Key %q missing from listing (returned: %v)", key, listed)
+		}
+	}
+
+	// Prefix filtering must work on the real key, not on an encoded form.
+	logs, err := store.ListObjects(bucket, "logs/")
+	if err != nil {
+		t.Fatalf("Failed to list with prefix: %v", err)
+	}
+	if len(logs) != 1 || logs[0] != "logs/2024/01/app.log" {
+		t.Errorf("Prefix listing returned %v, want [logs/2024/01/app.log]", logs)
+	}
+
+	for _, key := range keys {
+		if err := store.DeleteObjectMetadata(bucket, key); err != nil {
+			t.Errorf("Failed to delete key %q: %v", key, err)
+		}
+	}
+	if err := store.DeleteBucket(bucket); err != nil {
+		t.Errorf("Failed to delete bucket: %v", err)
+	}
+
+	t.Logf("\u2713 Key encoding tests passed for %s backend", store.Type())
+}
+
+// TestNotFoundErrors checks that absence is reported with the shared sentinel
+// errors, so callers can tell "no such object" from "the backend is down"
+// without matching on error strings.
+func (s *MetadataStoreTestSuite) TestNotFoundErrors() {
+	t := s.t
+	store := s.Store
+
+	const bucket = "sentinel-bucket"
+	if err := store.CreateBucket(bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
+	defer store.DeleteBucket(bucket)
+
+	if _, err := store.GetObjectMetadata(bucket, "no-such-object"); !errors.Is(err, ErrObjectNotFound) {
+		t.Errorf("GetObjectMetadata on a missing object: got %v, want ErrObjectNotFound", err)
+	}
+	if err := store.DeleteObjectMetadata(bucket, "no-such-object"); !errors.Is(err, ErrObjectNotFound) {
+		t.Errorf("DeleteObjectMetadata on a missing object: got %v, want ErrObjectNotFound", err)
+	}
+	if _, err := store.GetBucket("no-such-bucket"); !errors.Is(err, ErrBucketNotFound) {
+		t.Errorf("GetBucket on a missing bucket: got %v, want ErrBucketNotFound", err)
+	}
+	if err := store.CreateBucket(bucket); !errors.Is(err, ErrBucketExists) {
+		t.Errorf("CreateBucket on an existing bucket: got %v, want ErrBucketExists", err)
+	}
+
+	t.Logf("\u2713 Sentinel error tests passed for %s backend", store.Type())
+}
+
 // Run all tests in the suite
 func (s *MetadataStoreTestSuite) RunAll() {
 	s.TestHealth()
 	s.TestBucketLifecycle()
 	s.TestBucketEncryption()
 	s.TestObjectLifecycle()
+	s.TestKeyEncoding()
+	s.TestNotFoundErrors()
 	s.TestConcurrency()
 }
 

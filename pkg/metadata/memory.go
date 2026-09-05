@@ -42,7 +42,7 @@ func (s *MemoryStore) CreateBucketWithEncryption(name string, encryption Encrypt
 	defer s.mu.Unlock()
 
 	if _, exists := s.buckets[name]; exists {
-		return fmt.Errorf("bucket already exists: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketExists, name)
 	}
 
 	s.buckets[name] = &BucketMetadata{
@@ -60,7 +60,7 @@ func (s *MemoryStore) GetBucket(name string) (*BucketMetadata, error) {
 
 	bucket, exists := s.buckets[name]
 	if !exists {
-		return nil, fmt.Errorf("bucket not found: %s", name)
+		return nil, fmt.Errorf("%w: %s", ErrBucketNotFound, name)
 	}
 
 	return bucket, nil
@@ -108,12 +108,12 @@ func (s *MemoryStore) DeleteBucket(name string) error {
 	prefix := name + "/"
 	for key := range s.objects {
 		if strings.HasPrefix(key, prefix) {
-			return fmt.Errorf("bucket not empty: %s", name)
+			return fmt.Errorf("%w: %s", ErrBucketNotEmpty, name)
 		}
 	}
 
 	if _, exists := s.buckets[name]; !exists {
-		return fmt.Errorf("bucket not found: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketNotFound, name)
 	}
 
 	delete(s.buckets, name)
@@ -138,7 +138,7 @@ func (s *MemoryStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, er
 	fullKey := fmt.Sprintf("%s/%s", bucket, key)
 	meta, exists := s.objects[fullKey]
 	if !exists {
-		return nil, fmt.Errorf("object not found: %s/%s", bucket, key)
+		return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 	}
 
 	return meta, nil
@@ -149,6 +149,9 @@ func (s *MemoryStore) DeleteObjectMetadata(bucket, key string) error {
 	defer s.mu.Unlock()
 
 	fullKey := fmt.Sprintf("%s/%s", bucket, key)
+	if _, exists := s.objects[fullKey]; !exists {
+		return fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
+	}
 	delete(s.objects, fullKey)
 	return nil
 }
@@ -159,7 +162,7 @@ func (s *MemoryStore) ListObjects(bucket, prefix string) ([]string, error) {
 
 	// Check bucket exists
 	if _, exists := s.buckets[bucket]; !exists {
-		return nil, fmt.Errorf("bucket not found: %s", bucket)
+		return nil, fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 	}
 
 	bucketPrefix := bucket + "/"

@@ -1,6 +1,8 @@
 package metadata
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +11,73 @@ import (
 	"sync"
 	"time"
 )
+
+// objectFileName maps an object key to the file that holds its metadata.
+//
+// The key is hashed rather than escaped because a filename cannot represent an
+// arbitrary key: it is length-limited, may be case-insensitive (as on macOS and
+// Windows), and cannot contain a path separator. Any escaping scheme therefore
+// has keys it silently maps onto the same file, and two distinct keys sharing a
+// file means writing one destroys the other. Hashing has no such collisions in
+// practice, at the cost of an opaque filename.
+//
+// The real key is not lost: it is stored inside the file as ObjectMetadata.Key,
+// which is where ListObjects reads it back from.
+func objectFileName(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:]) + ".json"
+}
+
+// writeFileAtomic writes data to path so that a concurrent or post-crash reader
+// sees either the previous contents or the complete new contents, never a
+// half-written file.
+//
+// os.WriteFile truncates first and then writes, so a crash in between leaves a
+// short or empty file - and for metadata that means an object whose chunks are
+// all intact becomes permanently unreadable. Writing to a temporary file and
+// renaming avoids that: rename(2) is atomic within a filesystem.
+//
+// The two fsyncs serve a different purpose from the rename. Rename gives
+// atomicity (no torn state); fsync gives durability (the bytes, and then the
+// rename itself, actually reach the disk rather than sitting in the page cache).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename below has succeeded
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to set permissions: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("failed to sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("failed to commit file: %w", err)
+	}
+
+	// Persist the rename itself, not just the file contents.
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("failed to open directory for sync: %w", err)
+	}
+	defer d.Close()
+	return d.Sync()
+}
 
 type LocalStore struct {
 	basePath string
@@ -58,7 +127,7 @@ func (m *LocalStore) CreateBucketWithEncryption(name string, encryption Encrypti
 	bucketPath := filepath.Join(m.basePath, "buckets", name+".json")
 
 	if _, err := os.Stat(bucketPath); err == nil {
-		return fmt.Errorf("bucket already exists: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketExists, name)
 	}
 
 	bucket := BucketMetadata{
@@ -72,7 +141,7 @@ func (m *LocalStore) CreateBucketWithEncryption(name string, encryption Encrypti
 		return fmt.Errorf("failed to marshal bucket metadata: %w", err)
 	}
 
-	if err := os.WriteFile(bucketPath, data, 0644); err != nil {
+	if err := writeFileAtomic(bucketPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to save bucket metadata: %w", err)
 	}
 
@@ -93,7 +162,7 @@ func (m *LocalStore) GetBucket(name string) (*BucketMetadata, error) {
 	data, err := os.ReadFile(bucketPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("bucket not found: %s", name)
+			return nil, fmt.Errorf("%w: %s", ErrBucketNotFound, name)
 		}
 		return nil, fmt.Errorf("failed to read bucket metadata: %w", err)
 	}
@@ -177,7 +246,7 @@ func (m *LocalStore) DeleteBucket(name string) error {
 	objectsDir := filepath.Join(m.basePath, "objects", name)
 	entries, _ := os.ReadDir(objectsDir)
 	if len(entries) > 0 {
-		return fmt.Errorf("bucket not empty: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketNotEmpty, name)
 	}
 
 	os.RemoveAll(objectsDir)
@@ -219,15 +288,14 @@ func (m *LocalStore) SaveObjectMetadata(meta *ObjectMetadata) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	safeKey := strings.ReplaceAll(meta.Key, "/", "_")
-	objectPath := filepath.Join(m.basePath, "objects", meta.Bucket, safeKey+".json")
+	objectPath := filepath.Join(m.basePath, "objects", meta.Bucket, objectFileName(meta.Key))
 
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal object metadata: %w", err)
 	}
 
-	if err := os.WriteFile(objectPath, data, 0644); err != nil {
+	if err := writeFileAtomic(objectPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to save object metadata: %w", err)
 	}
 
@@ -244,7 +312,7 @@ func (m *LocalStore) SaveObjectMetadata(meta *ObjectMetadata) error {
 // 	data, err := os.ReadFile(metaFile)
 // 	if err != nil {
 // 		if os.IsNotExist(err) {
-// 			return nil, fmt.Errorf("object not found: %s/%s", bucket, key)
+// 			return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 // 		}
 // 		return nil, fmt.Errorf("failed to read metadata: %w", err)
 // 	}
@@ -261,13 +329,12 @@ func (m *LocalStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, err
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	safeKey := strings.ReplaceAll(key, "/", "_")
-	objectPath := filepath.Join(m.basePath, "objects", bucket, safeKey+".json")
+	objectPath := filepath.Join(m.basePath, "objects", bucket, objectFileName(key))
 
 	data, err := os.ReadFile(objectPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("object not found: %s/%s", bucket, key)
+			return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 		}
 		return nil, fmt.Errorf("failed to read object metadata: %w", err)
 	}
@@ -283,12 +350,11 @@ func (m *LocalStore) DeleteObjectMetadata(bucket, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	safeKey := strings.ReplaceAll(key, "/", "_")
-	objectPath := filepath.Join(m.basePath, "objects", bucket, safeKey+".json")
+	objectPath := filepath.Join(m.basePath, "objects", bucket, objectFileName(key))
 
 	if err := os.Remove(objectPath); err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("object not found: %s/%s", bucket, key)
+			return fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 		}
 		return fmt.Errorf("failed to delete metadata: %w", err)
 	}
@@ -335,15 +401,28 @@ func (m *LocalStore) ListObjects(bucket, prefix string) ([]string, error) {
 		return nil, fmt.Errorf("failed to read objects directory: %w", err)
 	}
 
+	// Filenames are hashes, so the key has to come from inside each file.
+	// That makes listing O(objects) reads on this backend; acceptable because
+	// the local store is the development backend, while etcd - the backend
+	// meant for real use - answers the same query with one range scan.
 	var objects []string
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
-			key := strings.TrimSuffix(entry.Name(), ".json")
-			key = strings.ReplaceAll(key, "_", "/")
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue // skips leftover .tmp-* files from an interrupted write
+		}
 
-			if prefix == "" || strings.HasPrefix(key, prefix) {
-				objects = append(objects, key)
-			}
+		data, err := os.ReadFile(filepath.Join(objectsDir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read object metadata %s: %w", entry.Name(), err)
+		}
+
+		var meta ObjectMetadata
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return nil, fmt.Errorf("failed to parse object metadata %s: %w", entry.Name(), err)
+		}
+
+		if prefix == "" || strings.HasPrefix(meta.Key, prefix) {
+			objects = append(objects, meta.Key)
 		}
 	}
 

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -399,6 +400,16 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 	}
 
 	startTime := time.Now()
+
+	// Every PutObject mints a fresh object ID, so an overwrite writes an
+	// entirely new set of chunk IDs and the previous object's chunks become
+	// unreferenced the moment the new metadata commits. Capture them now so
+	// they can be reclaimed once that commit has succeeded.
+	var superseded []metadata.ChunkInfo
+	if prev, err := s.Metadata.GetObjectMetadata(bucket, key); err == nil {
+		superseded = prev.Chunks
+	}
+
 	isEncrypted, _ := s.Metadata.IsBucketEncrypted(bucket)
 	var encryptor *crypto.Encryptor
 
@@ -517,6 +528,15 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 	if err := s.Metadata.SaveObjectMetadata(meta); err != nil {
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
+
+	// Past the commit point. Reclaiming the replaced chunks only now means a
+	// crash at this instant leaks storage, which a later sweep can recover;
+	// reclaiming them before the commit would have left the still-current
+	// metadata pointing at chunks that no longer exist, which nothing can.
+	if len(superseded) > 0 {
+		s.deleteChunks(superseded)
+	}
+
 	s.Metrics.RecordPutObject(bucket, totalSize, time.Since(startTime))
 	fmt.Println("  ✓ Object stored successfully!")
 	return meta, nil
@@ -745,29 +765,59 @@ func (s *Lilio) HeadObject(bucket, key string) (*metadata.ObjectMetadata, error)
 	return s.Metadata.GetObjectMetadata(bucket, key)
 }
 
+// DeleteObject removes an object and reclaims its chunks.
+//
+// Deleting an object that does not exist is not an error: DELETE has to be
+// idempotent so that a client which times out and retries does not get a
+// failure on the retry, when the first attempt in fact succeeded.
 func (s *Lilio) DeleteObject(bucket, key string) error {
 	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
 	if err != nil {
+		if errors.Is(err, metadata.ErrObjectNotFound) {
+			return nil
+		}
 		return err
 	}
 
-	// Delete all chunks
-	for _, chunkInfo := range meta.Chunks {
+	// The metadata write is the commit point, so it goes first. A crash between
+	// the two steps then leaves chunks that nothing references - recoverable by
+	// a sweep. The reverse order would leave metadata referencing chunks that
+	// have already been deleted: the object would still appear in listings and
+	// every read of it would fail, permanently. Leaked storage is a bookkeeping
+	// problem; a dangling pointer is data loss.
+	if err := s.Metadata.DeleteObjectMetadata(bucket, key); err != nil {
+		if errors.Is(err, metadata.ErrObjectNotFound) {
+			return nil // lost a race with a concurrent delete; still the desired state
+		}
+		return err
+	}
+
+	s.deleteChunks(meta.Chunks)
+	s.Metrics.RecordDeleteObject(bucket)
+
+	return nil
+}
+
+// deleteChunks removes chunks from every backend recorded as holding them.
+//
+// It is best-effort by design. It only ever runs after the metadata that
+// referenced these chunks has been removed or replaced, so a failure here leaks
+// storage rather than losing data. Returning an error would be misleading -
+// the caller's operation has already committed and cannot be undone.
+func (s *Lilio) deleteChunks(chunks []metadata.ChunkInfo) {
+	for _, chunkInfo := range chunks {
 		for _, backendName := range chunkInfo.StorageNodes {
 			backend, err := s.Registry.Get(backendName)
-			if err == nil {
-				backend.DeleteChunk(chunkInfo.ChunkID)
-				s.Metrics.RecordChunkDeleted(backendName)
+			if err != nil {
+				continue
 			}
+			if err := backend.DeleteChunk(chunkInfo.ChunkID); err != nil {
+				fmt.Printf("  ⚠ Failed to reclaim chunk %s on %s: %v\n", chunkInfo.ChunkID, backendName, err)
+				continue
+			}
+			s.Metrics.RecordChunkDeleted(backendName)
 		}
 	}
-
-	err = s.Metadata.DeleteObjectMetadata(bucket, key)
-	if err == nil {
-		s.Metrics.RecordDeleteObject(bucket)
-	}
-
-	return err
 }
 
 func (s *Lilio) ListObjects(bucket, prefix string) ([]string, error) {

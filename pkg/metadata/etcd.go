@@ -81,10 +81,15 @@ func (s *EtcdStore) bucketKey(name string) string {
 	return fmt.Sprintf("%s/buckets/%s", s.prefix, name)
 }
 
+// objectKey builds the etcd key for an object.
+//
+// The object key is appended verbatim. etcd keys are opaque byte strings, so a
+// "/" inside an object key needs no escaping: a prefix scan of objectsPrefix
+// still returns the object, and trimming that prefix recovers the key exactly.
+// The previous "/" -> ":" substitution was not only unnecessary but lossy, as
+// it made the keys "a/b" and "a:b" the same object.
 func (s *EtcdStore) objectKey(bucket, key string) string {
-	// Replace / in key with : to avoid conflicts
-	safeKey := strings.ReplaceAll(key, "/", ":")
-	return fmt.Sprintf("%s/objects/%s/%s", s.prefix, bucket, safeKey)
+	return s.objectsPrefix(bucket) + key
 }
 
 func (s *EtcdStore) objectsPrefix(bucket string) string {
@@ -111,7 +116,7 @@ func (s *EtcdStore) CreateBucketWithEncryption(name string, encryption Encryptio
 		return fmt.Errorf("failed to check bucket: %w", err)
 	}
 	if len(resp.Kvs) > 0 {
-		return fmt.Errorf("bucket already exists: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketExists, name)
 	}
 
 	// Create bucket metadata
@@ -137,7 +142,7 @@ func (s *EtcdStore) CreateBucketWithEncryption(name string, encryption Encryptio
 	}
 
 	if !txnResp.Succeeded {
-		return fmt.Errorf("bucket already exists: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketExists, name)
 	}
 
 	return nil
@@ -153,7 +158,7 @@ func (s *EtcdStore) GetBucket(name string) (*BucketMetadata, error) {
 	}
 
 	if len(resp.Kvs) == 0 {
-		return nil, fmt.Errorf("bucket not found: %s", name)
+		return nil, fmt.Errorf("%w: %s", ErrBucketNotFound, name)
 	}
 
 	var bucket BucketMetadata
@@ -221,7 +226,7 @@ func (s *EtcdStore) DeleteBucket(name string) error {
 		return fmt.Errorf("failed to check bucket objects: %w", err)
 	}
 	if len(objectsResp.Kvs) > 0 {
-		return fmt.Errorf("bucket not empty: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketNotEmpty, name)
 	}
 
 	// Delete bucket
@@ -261,7 +266,7 @@ func (s *EtcdStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, erro
 	}
 
 	if len(resp.Kvs) == 0 {
-		return nil, fmt.Errorf("object not found: %s/%s", bucket, key)
+		return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 	}
 
 	var meta ObjectMetadata
@@ -276,9 +281,12 @@ func (s *EtcdStore) DeleteObjectMetadata(bucket, key string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	defer cancel()
 
-	_, err := s.client.Delete(ctx, s.objectKey(bucket, key))
+	resp, err := s.client.Delete(ctx, s.objectKey(bucket, key))
 	if err != nil {
 		return fmt.Errorf("failed to delete object: %w", err)
+	}
+	if resp.Deleted == 0 {
+		return fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 	}
 
 	return nil
@@ -290,7 +298,7 @@ func (s *EtcdStore) ListObjects(bucket, prefix string) ([]string, error) {
 
 	// Check bucket exists
 	if !s.BucketExists(bucket) {
-		return nil, fmt.Errorf("bucket not found: %s", bucket)
+		return nil, fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 	}
 
 	searchPrefix := s.objectsPrefix(bucket)
@@ -304,8 +312,6 @@ func (s *EtcdStore) ListObjects(bucket, prefix string) ([]string, error) {
 		// Extract object key from etcd key
 		etcdKey := string(kv.Key)
 		objectKey := strings.TrimPrefix(etcdKey, searchPrefix)
-		// Convert back from : to /
-		objectKey = strings.ReplaceAll(objectKey, ":", "/")
 
 		// Apply prefix filter
 		if prefix == "" || strings.HasPrefix(objectKey, prefix) {

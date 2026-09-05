@@ -258,7 +258,8 @@ func handleDelete() {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// The server answers a successful delete with 204 No Content.
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Printf("Error: %s\n", string(body))
 		os.Exit(1)
