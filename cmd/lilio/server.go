@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/subhammahanty235/lilio/pkg/api"
 	"github.com/subhammahanty235/lilio/pkg/config"
@@ -160,6 +161,25 @@ func createBackend(cfg config.StorageConfig) (storage.StorageBackend, error) {
 		folderID := cfg.GetOption("folder_id", "")
 		return storagemodels.NewGDriveBackend(cfg.Name, credentials, tokenPath, folderID, cfg.Priority)
 		// return nil, fmt.Errorf("gdrive backend coming soon")
+
+	case "remote":
+		// A lilio-chunkd on another machine. Everything above this - the ring,
+		// quorum, read repair - treats it exactly like a local directory.
+		rawURL := cfg.GetOption("url", "")
+		if rawURL == "" {
+			return nil, fmt.Errorf("remote requires a 'url' option (e.g. http://192.168.1.42:9000)")
+		}
+
+		var timeout time.Duration
+		if t := cfg.GetOption("timeout", ""); t != "" {
+			parsed, err := time.ParseDuration(t)
+			if err != nil {
+				return nil, fmt.Errorf("invalid timeout %q: %w", t, err)
+			}
+			timeout = parsed
+		}
+
+		return storagemodels.NewRemoteBackend(cfg.Name, rawURL, cfg.Priority, timeout)
 
 	case "dropbox":
 		return nil, fmt.Errorf("dropbox backend coming soon")

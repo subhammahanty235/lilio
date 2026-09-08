@@ -203,9 +203,21 @@ func (c *Config) Validate() error {
 
 		validTypes := map[string]bool{
 			"local": true, "gdrive": true, "dropbox": true, "s3": true, "sftp": true,
+			"remote": true,
 		}
 		if !validTypes[s.Type] {
 			return fmt.Errorf("invalid storage type: %s", s.Type)
+		}
+
+		if s.Type == "remote" {
+			if s.GetOption("url", "") == "" {
+				return fmt.Errorf("storage %q: remote backend requires a 'url' option", s.Name)
+			}
+			if t := s.GetOption("timeout", ""); t != "" {
+				if _, err := time.ParseDuration(t); err != nil {
+					return fmt.Errorf("storage %q: invalid timeout %q: %w", s.Name, t, err)
+				}
+			}
 		}
 	}
 

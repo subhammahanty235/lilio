@@ -1,6 +1,9 @@
 package storage
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type BackendType string
 
@@ -10,6 +13,7 @@ const (
 	BackendTypeDropbox BackendType = "dropbox"
 	BackendTypeS3      BackendType = "s3"
 	BackendTypeSFTP    BackendType = "sftp"
+	BackendTypeRemote  BackendType = "remote"
 )
 
 type BackendStatus string
@@ -37,30 +41,43 @@ type BackendInfo struct {
 	Stats    BackendStats  `json:"stats"`
 }
 
+// StorageBackend is a content-addressed store for chunks. Implementations may
+// be a directory on this machine, a remote lilio-chunkd, or a cloud provider.
+//
+// Every method that can touch storage takes a context. This matters most for
+// backends reached over a network: unlike a local file operation, which either
+// completes or fails at once, a remote call can accept the connection and then
+// never answer. Without a deadline one unresponsive backend would block the
+// caller indefinitely - and since writes fan out to N replicas and wait for all
+// of them, that means blocking the whole request. The context is what bounds
+// that wait, and what lets a disconnecting client cancel the work it started.
+//
+// Info is the exception: it reports cached state and must not perform I/O, so
+// that listing or sorting backends never blocks on a slow one.
 type StorageBackend interface {
-	// Info returns metadata about this backend
+	// Info returns metadata about this backend. Must not perform I/O.
 	Info() BackendInfo
 
 	// Health checks if the backend is accessible
-	Health() error
+	Health(ctx context.Context) error
 
 	// StoreChunk stores a chunk of data
-	StoreChunk(chunkID string, data []byte) error
+	StoreChunk(ctx context.Context, chunkID string, data []byte) error
 
 	// RetrieveChunk retrieves a chunk of data
-	RetrieveChunk(chunkID string) ([]byte, error)
+	RetrieveChunk(ctx context.Context, chunkID string) ([]byte, error)
 
 	// DeleteChunk deletes a chunk
-	DeleteChunk(chunkID string) error
+	DeleteChunk(ctx context.Context, chunkID string) error
 
 	// HasChunk checks if a chunk exists
-	HasChunk(chunkID string) bool
+	HasChunk(ctx context.Context, chunkID string) bool
 
 	// ListChunks returns all chunk IDs stored in this backend
-	ListChunks() ([]string, error)
+	ListChunks(ctx context.Context) ([]string, error)
 
 	// Stats returns storage statistics
-	Stats() (BackendStats, error)
+	Stats(ctx context.Context) (BackendStats, error)
 }
 
 type BackendConfig struct {

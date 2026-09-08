@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"testing"
@@ -20,7 +21,7 @@ func TestQuorumWriteSuccess(t *testing.T) {
 
 	// Write should succeed (all 3 backends online, W=2)
 	data := []byte("test data for quorum write")
-	_, err := lilio.PutObject("test-bucket", "test-key", bytes.NewReader(data), int64(len(data)), "text/plain")
+	_, err := lilio.PutObject(context.Background(), "test-bucket", "test-key", bytes.NewReader(data), int64(len(data)), "text/plain")
 	if err != nil {
 		t.Fatalf("Write should succeed with 3/3 nodes and W=2: %v", err)
 	}
@@ -37,7 +38,7 @@ func TestQuorumWriteFailure(t *testing.T) {
 	addMockBackends(lilio, 1)
 
 	data := []byte("test data")
-	_, err := lilio.PutObject("test-bucket", "test-key", bytes.NewReader(data), int64(len(data)), "text/plain")
+	_, err := lilio.PutObject(context.Background(), "test-bucket", "test-key", bytes.NewReader(data), int64(len(data)), "text/plain")
 	if err == nil {
 		t.Fatal("Write should fail with only 1/2 required nodes")
 	}
@@ -58,14 +59,14 @@ func TestQuorumReadSuccess(t *testing.T) {
 
 	// Write data
 	data := []byte("read quorum test data")
-	_, err := lilio.PutObject("test-bucket", "read-key", bytes.NewReader(data), int64(len(data)), "text/plain")
+	_, err := lilio.PutObject(context.Background(), "test-bucket", "read-key", bytes.NewReader(data), int64(len(data)), "text/plain")
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
 
 	// Read should succeed (3 backends available, R=2)
 	var buf bytes.Buffer
-	err = lilio.GetObject("test-bucket", "read-key", &buf)
+	err = lilio.GetObject(context.Background(), "test-bucket", "read-key", &buf)
 	if err != nil {
 		t.Fatalf("Read should succeed with 3/3 nodes and R=2: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestQuorumReadFailure(t *testing.T) {
 
 	// Write data with all 3 nodes
 	data := []byte("strict quorum test")
-	_, err := lilio.PutObject("test-bucket", "strict-key", bytes.NewReader(data), int64(len(data)), "text/plain")
+	_, err := lilio.PutObject(context.Background(), "test-bucket", "strict-key", bytes.NewReader(data), int64(len(data)), "text/plain")
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
@@ -96,7 +97,7 @@ func TestQuorumReadFailure(t *testing.T) {
 
 	// Read should fail (only 2/3 nodes, R=3 requires all)
 	var buf bytes.Buffer
-	err = lilio.GetObject("test-bucket", "strict-key", &buf)
+	err = lilio.GetObject(context.Background(), "test-bucket", "strict-key", &buf)
 	if err == nil {
 		t.Fatal("Read should fail with only 2/3 nodes when R=3")
 	}
@@ -117,7 +118,7 @@ func TestReadRepair(t *testing.T) {
 
 	// Write initial data
 	data := []byte("original data")
-	meta, err := lilio.PutObject("test-bucket", "repair-key", bytes.NewReader(data), int64(len(data)), "text/plain")
+	meta, err := lilio.PutObject(context.Background(), "test-bucket", "repair-key", bytes.NewReader(data), int64(len(data)), "text/plain")
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
@@ -125,11 +126,11 @@ func TestReadRepair(t *testing.T) {
 	// Simulate corruption on one backend by overwriting chunk with bad data
 	backend, _ := lilio.Registry.Get("mock-backend-1")
 	chunkID := meta.Chunks[0].ChunkID
-	backend.StoreChunk(chunkID, []byte("corrupted data"))
+	backend.StoreChunk(context.Background(), chunkID, []byte("corrupted data"))
 
 	// Read should trigger read repair
 	var buf bytes.Buffer
-	err = lilio.GetObject("test-bucket", "repair-key", &buf)
+	err = lilio.GetObject(context.Background(), "test-bucket", "repair-key", &buf)
 	if err != nil {
 		t.Fatalf("Read should succeed and trigger repair: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestReadRepair(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify repaired data on backend-1
-	repairedData, err := backend.RetrieveChunk(chunkID)
+	repairedData, err := backend.RetrieveChunk(context.Background(), chunkID)
 	if err != nil {
 		t.Fatalf("Failed to retrieve repaired chunk: %v", err)
 	}
@@ -293,12 +294,12 @@ type MockBackend struct {
 	chunks map[string][]byte
 }
 
-func (m *MockBackend) StoreChunk(chunkID string, data []byte) error {
+func (m *MockBackend) StoreChunk(ctx context.Context, chunkID string, data []byte) error {
 	m.chunks[chunkID] = data
 	return nil
 }
 
-func (m *MockBackend) RetrieveChunk(chunkID string) ([]byte, error) {
+func (m *MockBackend) RetrieveChunk(ctx context.Context, chunkID string) ([]byte, error) {
 	data, exists := m.chunks[chunkID]
 	if !exists {
 		return nil, fmt.Errorf("chunk not found: %s", chunkID)
@@ -306,7 +307,7 @@ func (m *MockBackend) RetrieveChunk(chunkID string) ([]byte, error) {
 	return data, nil
 }
 
-func (m *MockBackend) DeleteChunk(chunkID string) error {
+func (m *MockBackend) DeleteChunk(ctx context.Context, chunkID string) error {
 	delete(m.chunks, chunkID)
 	return nil
 }
@@ -320,23 +321,23 @@ func (m *MockBackend) Info() BackendInfo {
 	}
 }
 
-func (m *MockBackend) Stats() (BackendStats, error) {
+func (m *MockBackend) Stats(ctx context.Context) (BackendStats, error) {
 	return BackendStats{
 		ChunksStored: int64(len(m.chunks)),
 		BytesUsed:    0,
 	}, nil
 }
 
-func (m *MockBackend) Health() error {
+func (m *MockBackend) Health(ctx context.Context) error {
 	return nil
 }
 
-func (m *MockBackend) HasChunk(chunkID string) bool {
+func (m *MockBackend) HasChunk(ctx context.Context, chunkID string) bool {
 	_, exists := m.chunks[chunkID]
 	return exists
 }
 
-func (m *MockBackend) ListChunks() ([]string, error) {
+func (m *MockBackend) ListChunks(ctx context.Context) ([]string, error) {
 	var chunks []string
 	for id := range m.chunks {
 		chunks = append(chunks, id)

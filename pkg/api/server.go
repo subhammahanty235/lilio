@@ -196,13 +196,13 @@ func (s *Server) handleListBucketsDetailed(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleBucketsOrObjects(w http.ResponseWriter, r *http.Request) {
 	bucket, key := parsePath(r.URL.Path)
 	if bucket == "admin" && key == "stats" {
-		stats := s.lio.GetStorageStats()
+		stats := s.lio.GetStorageStats(r.Context())
 		jsonResponse(w, http.StatusOK, stats)
 		return
 	}
 
 	if bucket == "admin" && key == "health" {
-		healthErrors := s.lio.HealthCheck()
+		healthErrors := s.lio.HealthCheck(r.Context())
 
 		// Convert to a more user-friendly format
 		healthStatus := make(map[string]interface{})
@@ -340,7 +340,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		if contentType == "" {
 			contentType = "application/octet-stream"
 		}
-		meta, err := s.lio.PutObject(bucket, key, r.Body, r.ContentLength, contentType)
+		meta, err := s.lio.PutObject(r.Context(), bucket, key, r.Body, r.ContentLength, contentType)
 		if err != nil {
 			writeObjectError(w, err)
 			return
@@ -363,7 +363,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		setObjectHeaders(w, meta)
 
 		body := &deferredWriter{w: w, status: http.StatusOK}
-		if err := s.lio.GetObject(bucket, key, body); err != nil {
+		if err := s.lio.GetObject(r.Context(), bucket, key, body); err != nil {
 			if !body.written {
 				// Nothing has reached the client yet, so the failure can still
 				// be reported as a status code.
@@ -394,7 +394,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodDelete:
-		if err := s.lio.DeleteObject(bucket, key); err != nil {
+		if err := s.lio.DeleteObject(r.Context(), bucket, key); err != nil {
 			writeObjectError(w, err)
 			return
 		}

@@ -1,6 +1,7 @@
 package storagemodels
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,7 +33,7 @@ func NewLocalBackendPod(name, basePath string, priority int) (*LocalBackendPod, 
 		priority: priority,
 	}
 
-	chunks, _ := backend.ListChunks()
+	chunks, _ := backend.ListChunks(context.Background())
 	backend.chunksStored = int64(len(chunks))
 	return backend, nil
 }
@@ -40,9 +41,11 @@ func NewLocalBackendPod(name, basePath string, priority int) (*LocalBackendPod, 
 // function to return the metadata about this backend
 
 func (l *LocalBackendPod) Info() storage.BackendInfo {
-	stats, _ := l.Stats()
+	// Local disk access is bounded by the kernel, so probing here cannot hang
+	// the way a network call could. A remote backend must not do this.
+	stats, _ := l.Stats(context.Background())
 	status := storage.StatusOnline
-	if err := l.Health(); err != nil {
+	if err := l.Health(context.Background()); err != nil {
 		status = storage.StatusOffline
 	}
 
@@ -55,7 +58,7 @@ func (l *LocalBackendPod) Info() storage.BackendInfo {
 	}
 }
 
-func (l *LocalBackendPod) Health() error {
+func (l *LocalBackendPod) Health(ctx context.Context) error {
 	// Check if directory exists and is writable
 	testFile := filepath.Join(l.basePath, ".health_check")
 
@@ -67,7 +70,7 @@ func (l *LocalBackendPod) Health() error {
 	return nil
 }
 
-func (l *LocalBackendPod) ListChunks() ([]string, error) {
+func (l *LocalBackendPod) ListChunks(ctx context.Context) ([]string, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -86,7 +89,7 @@ func (l *LocalBackendPod) ListChunks() ([]string, error) {
 	return chunks, nil
 }
 
-func (l *LocalBackendPod) Stats() (storage.BackendStats, error) {
+func (l *LocalBackendPod) Stats(ctx context.Context) (storage.BackendStats, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -105,7 +108,7 @@ func (l *LocalBackendPod) Stats() (storage.BackendStats, error) {
 	}, nil
 }
 
-func (l *LocalBackendPod) StoreChunk(chunkID string, data []byte) error {
+func (l *LocalBackendPod) StoreChunk(ctx context.Context, chunkID string, data []byte) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -121,7 +124,7 @@ func (l *LocalBackendPod) StoreChunk(chunkID string, data []byte) error {
 	return nil
 }
 
-func (l *LocalBackendPod) RetrieveChunk(chunkID string) ([]byte, error) {
+func (l *LocalBackendPod) RetrieveChunk(ctx context.Context, chunkID string) ([]byte, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -138,13 +141,13 @@ func (l *LocalBackendPod) RetrieveChunk(chunkID string) ([]byte, error) {
 	return data, nil
 }
 
-func (l *LocalBackendPod) HasChunk(chunkID string) bool {
+func (l *LocalBackendPod) HasChunk(ctx context.Context, chunkID string) bool {
 	chunkPath := filepath.Join(l.basePath, chunkID)
 	_, err := os.Stat(chunkPath)
 	return err == nil
 }
 
-func (l *LocalBackendPod) DeleteChunk(chunkID string) error {
+func (l *LocalBackendPod) DeleteChunk(ctx context.Context, chunkID string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

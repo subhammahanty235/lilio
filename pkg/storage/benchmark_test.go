@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -47,7 +48,7 @@ func benchmarkPutObject(b *testing.B, size int64) {
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("bench-key-%d", i)
 		reader := bytes.NewReader(data)
-		_, err := lilio.PutObject("bench-bucket", key, reader, size, "application/octet-stream")
+		_, err := lilio.PutObject(context.Background(), "bench-bucket", key, reader, size, "application/octet-stream")
 		if err != nil {
 			b.Fatalf("PutObject failed: %v", err)
 		}
@@ -85,7 +86,7 @@ func benchmarkGetObject(b *testing.B, size int64) {
 		data[i] = byte(i % 256)
 	}
 
-	_, err := lilio.PutObject("bench-bucket", "get-bench-key", bytes.NewReader(data), size, "application/octet-stream")
+	_, err := lilio.PutObject(context.Background(), "bench-bucket", "get-bench-key", bytes.NewReader(data), size, "application/octet-stream")
 	if err != nil {
 		b.Fatalf("Setup failed: %v", err)
 	}
@@ -95,7 +96,7 @@ func benchmarkGetObject(b *testing.B, size int64) {
 
 	for i := 0; i < b.N; i++ {
 		var buf bytes.Buffer
-		err := lilio.GetObject("bench-bucket", "get-bench-key", &buf)
+		err := lilio.GetObject(context.Background(), "bench-bucket", "get-bench-key", &buf)
 		if err != nil {
 			b.Fatalf("GetObject failed: %v", err)
 		}
@@ -137,7 +138,7 @@ func benchmarkConcurrentUploads(b *testing.B, concurrency int, size int64) {
 				defer wg.Done()
 				key := fmt.Sprintf("concurrent-key-%d-%d", i, id)
 				reader := bytes.NewReader(data)
-				_, err := lilio.PutObject("bench-bucket", key, reader, size, "application/octet-stream")
+				_, err := lilio.PutObject(context.Background(), "bench-bucket", key, reader, size, "application/octet-stream")
 				if err != nil {
 					errChan <- err
 				}
@@ -182,7 +183,7 @@ func benchmarkQuorumOverhead(b *testing.B, n, w, r int) {
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("quorum-bench-%d", i)
 		reader := bytes.NewReader(data)
-		_, err := lilio.PutObject("bench-bucket", key, reader, size, "application/octet-stream")
+		_, err := lilio.PutObject(context.Background(), "bench-bucket", key, reader, size, "application/octet-stream")
 		if err != nil {
 			b.Fatalf("PutObject failed: %v", err)
 		}
@@ -290,7 +291,7 @@ func benchmarkMemoryAllocation(b *testing.B, size int64) {
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("mem-bench-%d", i)
 		reader := bytes.NewReader(data)
-		_, err := lilio.PutObject("bench-bucket", key, reader, size, "application/octet-stream")
+		_, err := lilio.PutObject(context.Background(), "bench-bucket", key, reader, size, "application/octet-stream")
 		if err != nil {
 			b.Fatalf("PutObject failed: %v", err)
 		}
@@ -302,7 +303,7 @@ func BenchmarkStressTest_MaxConcurrency(b *testing.B) {
 	lilio := setupBenchLilio(b, 3, 2, 2)
 	defer cleanupBench(lilio)
 
-	concurrency := 200 // High concurrency
+	concurrency := 200        // High concurrency
 	size := int64(512 * 1024) // 512KB per file
 
 	data := make([]byte, size)
@@ -324,7 +325,7 @@ func BenchmarkStressTest_MaxConcurrency(b *testing.B) {
 				defer wg.Done()
 				key := fmt.Sprintf("stress-key-%d-%d", i, id)
 				reader := bytes.NewReader(data)
-				_, err := lilio.PutObject("bench-bucket", key, reader, size, "application/octet-stream")
+				_, err := lilio.PutObject(context.Background(), "bench-bucket", key, reader, size, "application/octet-stream")
 				if err != nil {
 					errChan <- err
 				}
@@ -369,7 +370,7 @@ func BenchmarkThroughput_Sequential(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("throughput-key-%d", i)
 		reader := bytes.NewReader(data)
-		_, err := lilio.PutObject("bench-bucket", key, reader, size, "application/octet-stream")
+		_, err := lilio.PutObject(context.Background(), "bench-bucket", key, reader, size, "application/octet-stream")
 		if err != nil {
 			b.Fatalf("PutObject failed: %v", err)
 		}

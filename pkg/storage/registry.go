@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
@@ -122,14 +123,14 @@ func (r *Registry) GetNames() []string {
 	return names
 }
 
-func (r *Registry) HealthCheck() map[string]error {
+func (r *Registry) HealthCheck(ctx context.Context) map[string]error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	unhealthy := make(map[string]error)
 
 	for name, backend := range r.backends {
-		if err := backend.Health(); err != nil {
+		if err := backend.Health(ctx); err != nil {
 			unhealthy[name] = err
 		}
 	}

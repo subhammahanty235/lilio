@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 
@@ -16,7 +17,7 @@ func chunkIDsOnBackends(t *testing.T, lilio *Lilio) map[string]int {
 
 	held := make(map[string]int)
 	for _, backend := range lilio.Registry.List() {
-		ids, err := backend.ListChunks()
+		ids, err := backend.ListChunks(context.Background())
 		if err != nil {
 			t.Fatalf("ListChunks on %s: %v", backend.Info().Name, err)
 		}
@@ -36,7 +37,7 @@ func TestDeleteObjectRemovesChunksAndMetadata(t *testing.T) {
 	addMockBackends(lilio, 3)
 
 	data := bytes.Repeat([]byte("delete me "), 300) // spans several chunks
-	meta, err := lilio.PutObject("test-bucket", "doomed", bytes.NewReader(data), int64(len(data)), "text/plain")
+	meta, err := lilio.PutObject(context.Background(), "test-bucket", "doomed", bytes.NewReader(data), int64(len(data)), "text/plain")
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
@@ -45,7 +46,7 @@ func TestDeleteObjectRemovesChunksAndMetadata(t *testing.T) {
 		t.Fatal("Expected chunks on backends after put")
 	}
 
-	if err := lilio.DeleteObject("test-bucket", "doomed"); err != nil {
+	if err := lilio.DeleteObject(context.Background(), "test-bucket", "doomed"); err != nil {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
@@ -72,19 +73,19 @@ func TestDeleteObjectIsIdempotent(t *testing.T) {
 	defer cleanup(lilio)
 	addMockBackends(lilio, 3)
 
-	if err := lilio.DeleteObject("test-bucket", "never-existed"); err != nil {
+	if err := lilio.DeleteObject(context.Background(), "test-bucket", "never-existed"); err != nil {
 		t.Errorf("Deleting a missing object should succeed, got: %v", err)
 	}
 
 	data := []byte("transient")
-	if _, err := lilio.PutObject("test-bucket", "twice", bytes.NewReader(data), int64(len(data)), "text/plain"); err != nil {
+	if _, err := lilio.PutObject(context.Background(), "test-bucket", "twice", bytes.NewReader(data), int64(len(data)), "text/plain"); err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
 
-	if err := lilio.DeleteObject("test-bucket", "twice"); err != nil {
+	if err := lilio.DeleteObject(context.Background(), "test-bucket", "twice"); err != nil {
 		t.Fatalf("First delete failed: %v", err)
 	}
-	if err := lilio.DeleteObject("test-bucket", "twice"); err != nil {
+	if err := lilio.DeleteObject(context.Background(), "test-bucket", "twice"); err != nil {
 		t.Errorf("Second delete should succeed, got: %v", err)
 	}
 }
@@ -99,13 +100,13 @@ func TestOverwriteReclaimsSupersededChunks(t *testing.T) {
 	addMockBackends(lilio, 3)
 
 	first := bytes.Repeat([]byte("first version "), 200)
-	firstMeta, err := lilio.PutObject("test-bucket", "doc", bytes.NewReader(first), int64(len(first)), "text/plain")
+	firstMeta, err := lilio.PutObject(context.Background(), "test-bucket", "doc", bytes.NewReader(first), int64(len(first)), "text/plain")
 	if err != nil {
 		t.Fatalf("First put failed: %v", err)
 	}
 
 	second := bytes.Repeat([]byte("second version "), 200)
-	secondMeta, err := lilio.PutObject("test-bucket", "doc", bytes.NewReader(second), int64(len(second)), "text/plain")
+	secondMeta, err := lilio.PutObject(context.Background(), "test-bucket", "doc", bytes.NewReader(second), int64(len(second)), "text/plain")
 	if err != nil {
 		t.Fatalf("Second put failed: %v", err)
 	}
@@ -125,7 +126,7 @@ func TestOverwriteReclaimsSupersededChunks(t *testing.T) {
 
 	// The object must still read back as the new version.
 	var buf bytes.Buffer
-	if err := lilio.GetObject("test-bucket", "doc", &buf); err != nil {
+	if err := lilio.GetObject(context.Background(), "test-bucket", "doc", &buf); err != nil {
 		t.Fatalf("Read after overwrite failed: %v", err)
 	}
 	if !bytes.Equal(buf.Bytes(), second) {
@@ -144,7 +145,7 @@ func TestFailedWriteLeavesNoMetadata(t *testing.T) {
 	addMockBackends(lilio, 1) // only 1 backend, W=2 cannot be met
 
 	data := []byte("doomed write")
-	if _, err := lilio.PutObject("test-bucket", "partial", bytes.NewReader(data), int64(len(data)), "text/plain"); err == nil {
+	if _, err := lilio.PutObject(context.Background(), "test-bucket", "partial", bytes.NewReader(data), int64(len(data)), "text/plain"); err == nil {
 		t.Fatal("Expected the write to fail when quorum cannot be met")
 	}
 
@@ -162,7 +163,7 @@ func TestFailedOverwriteLeavesPreviousVersionReadable(t *testing.T) {
 	addMockBackends(lilio, 3)
 
 	original := []byte("the version that must survive")
-	if _, err := lilio.PutObject("test-bucket", "doc", bytes.NewReader(original), int64(len(original)), "text/plain"); err != nil {
+	if _, err := lilio.PutObject(context.Background(), "test-bucket", "doc", bytes.NewReader(original), int64(len(original)), "text/plain"); err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
 
@@ -181,7 +182,7 @@ func TestFailedOverwriteLeavesPreviousVersionReadable(t *testing.T) {
 	}
 
 	replacement := []byte("this write will not succeed")
-	if _, err := lilio.PutObject("test-bucket", "doc", bytes.NewReader(replacement), int64(len(replacement)), "text/plain"); err == nil {
+	if _, err := lilio.PutObject(context.Background(), "test-bucket", "doc", bytes.NewReader(replacement), int64(len(replacement)), "text/plain"); err == nil {
 		t.Fatal("Expected the overwrite to fail when quorum cannot be met")
 	}
 
@@ -193,7 +194,7 @@ func TestFailedOverwriteLeavesPreviousVersionReadable(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := lilio.GetObject("test-bucket", "doc", &buf); err != nil {
+	if err := lilio.GetObject(context.Background(), "test-bucket", "doc", &buf); err != nil {
 		t.Fatalf("Original should still be readable after a failed overwrite: %v", err)
 	}
 	if !bytes.Equal(buf.Bytes(), original) {

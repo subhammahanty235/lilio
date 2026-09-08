@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -34,6 +35,16 @@ func DefaultQuorum(rf int) QuorumConfig {
 	}
 
 }
+
+// backgroundOpTimeout bounds work that continues after a request has been
+// answered - read repair and post-commit chunk cleanup.
+//
+// This work deliberately does not use the request's context. If it did, it
+// would be cancelled the moment the response is written or the client hangs
+// up, which would mean a read repair almost never completes and a delete
+// almost never reclaims its chunks. It still needs *some* deadline, or a
+// wedged backend would leak a goroutine per request.
+const backgroundOpTimeout = 30 * time.Second
 
 type FailedBackend struct {
 	Name     string
@@ -394,7 +405,7 @@ func (s *Lilio) ListBuckets() ([]string, error) {
 // 	return meta, nil
 // }
 
-func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, contentType string) (*metadata.ObjectMetadata, error) {
+func (s *Lilio) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, contentType string) (*metadata.ObjectMetadata, error) {
 	if !s.Metadata.BucketExists(bucket) {
 		return nil, fmt.Errorf("bucket does not exist: %s", bucket)
 	}
@@ -474,7 +485,7 @@ func (s *Lilio) PutObject(bucket, key string, reader io.Reader, size int64, cont
 			wg.Add(1)
 			go func(b StorageBackend) {
 				defer wg.Done()
-				if err := b.StoreChunk(chunkId, chunkData); err == nil {
+				if err := b.StoreChunk(ctx, chunkId, chunkData); err == nil {
 					mu.Lock()
 					successfulNodes = append(successfulNodes, b.Info().Name)
 					mu.Unlock()
@@ -548,7 +559,7 @@ func generateUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-func (s *Lilio) GetObjectOld(bucket, key string) ([]byte, error) {
+func (s *Lilio) GetObjectOld(ctx context.Context, bucket, key string) ([]byte, error) {
 
 	//  --------- flow ------------
 	// Fetch the metadata
@@ -589,7 +600,7 @@ func (s *Lilio) GetObjectOld(bucket, key string) ([]byte, error) {
 				continue
 			}
 
-			data, err := backend.RetrieveChunk(chunkInfo.ChunkID)
+			data, err := backend.RetrieveChunk(ctx, chunkInfo.ChunkID)
 			if err != nil {
 				continue
 			}
@@ -622,7 +633,7 @@ func (s *Lilio) GetObjectOld(bucket, key string) ([]byte, error) {
 	return fullData, nil
 }
 
-func (s *Lilio) GetObject(bucket, key string, writer io.Writer) error {
+func (s *Lilio) GetObject(ctx context.Context, bucket, key string, writer io.Writer) error {
 	startTime := time.Now()
 	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
 	if err != nil {
@@ -650,7 +661,7 @@ func (s *Lilio) GetObject(bucket, key string, writer io.Writer) error {
 
 	// var chunksData [][]byte
 	for _, chunkInfo := range meta.Chunks {
-		chunkData, err := s.retrieveChunk(chunkInfo)
+		chunkData, err := s.retrieveChunk(ctx, chunkInfo)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve chunk %d: %w", chunkInfo.ChunkIndex, err)
 
@@ -683,7 +694,7 @@ type ChunkResponse struct {
 	Valid    bool
 }
 
-func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
+func (s *Lilio) retrieveChunk(ctx context.Context, chunkInfo metadata.ChunkInfo) ([]byte, error) {
 	var response []ChunkResponse
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -696,7 +707,7 @@ func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
 			if err != nil {
 				return
 			}
-			data, err := backend.RetrieveChunk(chunkInfo.ChunkID)
+			data, err := backend.RetrieveChunk(ctx, chunkInfo.ChunkID)
 			if err != nil {
 				return
 			}
@@ -740,6 +751,7 @@ func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
 	}
 	if len(staleNodes) > 0 {
 		go s.readRepair(chunkInfo.ChunkID, validResponses[0].Data, staleNodes)
+
 	}
 	fmt.Printf("    Quorum R=%d/%d, valid=%d, repaired=%d\n",
 		len(response), s.Quorum.R, len(validResponses), len(staleNodes))
@@ -747,14 +759,22 @@ func (s *Lilio) retrieveChunk(chunkInfo metadata.ChunkInfo) ([]byte, error) {
 	return validResponses[0].Data, nil
 }
 
+// readRepair rewrites a chunk onto replicas that returned the wrong bytes.
+//
+// It runs detached from the read that triggered it: the caller's context is
+// finished (or nearly) by the time this goroutine gets to work, so using it
+// would cancel almost every repair before it started.
 func (s *Lilio) readRepair(chunkId string, data []byte, staleNodes []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundOpTimeout)
+	defer cancel()
+
 	for _, nodeName := range staleNodes {
 		backend, err := s.Registry.Get(nodeName)
 		if err != nil {
 			continue
 		}
 
-		if err := backend.StoreChunk(chunkId, data); err == nil {
+		if err := backend.StoreChunk(ctx, chunkId, data); err == nil {
 			fmt.Printf("    🔧 Read repair: fixed %s on %s\n", chunkId, nodeName)
 			s.Metrics.RecordReadRepair(nodeName)
 		}
@@ -770,7 +790,7 @@ func (s *Lilio) HeadObject(bucket, key string) (*metadata.ObjectMetadata, error)
 // Deleting an object that does not exist is not an error: DELETE has to be
 // idempotent so that a client which times out and retries does not get a
 // failure on the retry, when the first attempt in fact succeeded.
-func (s *Lilio) DeleteObject(bucket, key string) error {
+func (s *Lilio) DeleteObject(ctx context.Context, bucket, key string) error {
 	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrObjectNotFound) {
@@ -805,13 +825,19 @@ func (s *Lilio) DeleteObject(bucket, key string) error {
 // storage rather than losing data. Returning an error would be misleading -
 // the caller's operation has already committed and cannot be undone.
 func (s *Lilio) deleteChunks(chunks []metadata.ChunkInfo) {
+	// Detached for the same reason as readRepair: this runs after the metadata
+	// commit, so a client that hangs up mid-request must not leave the chunks
+	// it just orphaned lying around.
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundOpTimeout)
+	defer cancel()
+
 	for _, chunkInfo := range chunks {
 		for _, backendName := range chunkInfo.StorageNodes {
 			backend, err := s.Registry.Get(backendName)
 			if err != nil {
 				continue
 			}
-			if err := backend.DeleteChunk(chunkInfo.ChunkID); err != nil {
+			if err := backend.DeleteChunk(ctx, chunkInfo.ChunkID); err != nil {
 				fmt.Printf("  ⚠ Failed to reclaim chunk %s on %s: %v\n", chunkInfo.ChunkID, backendName, err)
 				continue
 			}
@@ -825,12 +851,12 @@ func (s *Lilio) ListObjects(bucket, prefix string) ([]string, error) {
 }
 
 // Storage stats
-func (s *Lilio) GetStorageStats() map[string]map[string]interface{} {
+func (s *Lilio) GetStorageStats(ctx context.Context) map[string]map[string]interface{} {
 	stats := make(map[string]map[string]interface{})
 
 	for _, backend := range s.Registry.List() {
 		info := backend.Info()
-		backendStats, _ := backend.Stats()
+		backendStats, _ := backend.Stats(ctx)
 
 		stats[info.Name] = map[string]interface{}{
 			"node_id":       info.Name,
@@ -844,8 +870,8 @@ func (s *Lilio) GetStorageStats() map[string]map[string]interface{} {
 	return stats
 }
 
-func (s *Lilio) HealthCheck() map[string]error {
-	healthStatus := s.Registry.HealthCheck()
+func (s *Lilio) HealthCheck(ctx context.Context) map[string]error {
+	healthStatus := s.Registry.HealthCheck(ctx)
 
 	// Record backend health metrics
 	for nodeName, err := range healthStatus {
