@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/subhammahanty235/lilio/internal/fsatomic"
 )
 
 // objectFileName maps an object key to the file that holds its metadata.
@@ -26,57 +28,6 @@ import (
 func objectFileName(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:]) + ".json"
-}
-
-// writeFileAtomic writes data to path so that a concurrent or post-crash reader
-// sees either the previous contents or the complete new contents, never a
-// half-written file.
-//
-// os.WriteFile truncates first and then writes, so a crash in between leaves a
-// short or empty file - and for metadata that means an object whose chunks are
-// all intact becomes permanently unreadable. Writing to a temporary file and
-// renaming avoids that: rename(2) is atomic within a filesystem.
-//
-// The two fsyncs serve a different purpose from the rename. Rename gives
-// atomicity (no torn state); fsync gives durability (the bytes, and then the
-// rename itself, actually reach the disk rather than sitting in the page cache).
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once the rename below has succeeded
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return fmt.Errorf("failed to write temp file: %w", err)
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return fmt.Errorf("failed to set permissions: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("failed to sync temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("failed to commit file: %w", err)
-	}
-
-	// Persist the rename itself, not just the file contents.
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("failed to open directory for sync: %w", err)
-	}
-	defer d.Close()
-	return d.Sync()
 }
 
 type LocalStore struct {
@@ -141,7 +92,7 @@ func (m *LocalStore) CreateBucketWithEncryption(name string, encryption Encrypti
 		return fmt.Errorf("failed to marshal bucket metadata: %w", err)
 	}
 
-	if err := writeFileAtomic(bucketPath, data, 0644); err != nil {
+	if err := fsatomic.WriteFile(bucketPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to save bucket metadata: %w", err)
 	}
 
@@ -295,7 +246,7 @@ func (m *LocalStore) SaveObjectMetadata(meta *ObjectMetadata) error {
 		return fmt.Errorf("failed to marshal object metadata: %w", err)
 	}
 
-	if err := writeFileAtomic(objectPath, data, 0644); err != nil {
+	if err := fsatomic.WriteFile(objectPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to save object metadata: %w", err)
 	}
 

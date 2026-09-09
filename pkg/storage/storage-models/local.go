@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/subhammahanty235/lilio/internal/fsatomic"
 	"github.com/subhammahanty235/lilio/pkg/storage"
 	// "github.com/subhammahanty235/lilio/pkg/storage"
 )
@@ -81,9 +82,15 @@ func (l *LocalBackendPod) ListChunks(ctx context.Context) ([]string, error) {
 
 	var chunks []string
 	for _, entry := range entries {
-		if !entry.IsDir() && entry.Name() != ".health_check" {
-			chunks = append(chunks, entry.Name())
+		if entry.IsDir() || entry.Name() == ".health_check" {
+			continue
 		}
+		// An interrupted write leaves its temp file behind. It is not a chunk,
+		// and reporting it as one would have the scrubber flag it as an orphan.
+		if fsatomic.IsTemp(entry.Name()) {
+			continue
+		}
+		chunks = append(chunks, entry.Name())
 	}
 
 	return chunks, nil
@@ -114,7 +121,19 @@ func (l *LocalBackendPod) StoreChunk(ctx context.Context, chunkID string, data [
 
 	chunkPath := filepath.Join(l.basePath, chunkID)
 
-	if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+	// Replace, not WriteFile: atomic but not fsynced.
+	//
+	// Atomicity is what this call needs. A write cut short by a crash must
+	// leave either the previous chunk or nothing, never a truncated file -
+	// because the cheap scrub mode decides a replica is healthy by asking
+	// whether the chunk exists, and a partial file answers yes.
+	//
+	// Durability is already covered: a chunk lives on N nodes and the scrubber
+	// restores any copy a node loses. Paying an fsync per chunk would buy what
+	// replication already provides, at more than ten times the cost of the
+	// write. Metadata, which has no replicas to fall back on, still uses
+	// WriteFile.
+	if err := fsatomic.Replace(chunkPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to store chunk %s: %w", chunkID, err)
 	}
 
