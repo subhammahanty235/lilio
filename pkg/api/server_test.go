@@ -27,7 +27,7 @@ func testServer(t *testing.T) (string, []string) {
 		BasePath:          root,
 		ChunkSize:         16, // small, so modest payloads still span many chunks
 		ReplicationFactor: 3,
-		Quorum:            &storage.QuorumConfig{N: 3, W: 2, R: 2},
+		Quorum:            &storage.QuorumConfig{N: 3, W: 2},
 		MetadataConfig:    &metadata.Config{Type: metadata.StoreTypeMemory},
 		MetricsConfig:     &metrics.Config{Enabled: false},
 	})

@@ -32,7 +32,7 @@ func chunkIDsOnBackends(t *testing.T, lilio *Lilio) map[string]int {
 // Before DELETE was routed, this whole path was unreachable from the API and
 // the chunks were never reclaimed.
 func TestDeleteObjectRemovesChunksAndMetadata(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2)
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
 	addMockBackends(lilio, 3)
 
@@ -69,7 +69,7 @@ func TestDeleteObjectRemovesChunksAndMetadata(t *testing.T) {
 // out will retry, and the retry must not report failure for work the first
 // attempt already completed.
 func TestDeleteObjectIsIdempotent(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2)
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
 	addMockBackends(lilio, 3)
 
@@ -95,7 +95,7 @@ func TestDeleteObjectIsIdempotent(t *testing.T) {
 // chunk IDs, so without explicit reclamation the previous object's chunks stay
 // on disk forever, referenced by nothing.
 func TestOverwriteReclaimsSupersededChunks(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2)
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
 	addMockBackends(lilio, 3)
 
@@ -140,7 +140,7 @@ func TestOverwriteReclaimsSupersededChunks(t *testing.T) {
 // at absent chunks could not be recovered at all - but the object must not
 // become visible.
 func TestFailedWriteLeavesNoMetadata(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2)
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
 	addMockBackends(lilio, 1) // only 1 backend, W=2 cannot be met
 
@@ -158,7 +158,7 @@ func TestFailedWriteLeavesNoMetadata(t *testing.T) {
 // and readable. This is the case that would break if superseded chunks were
 // reclaimed before the new metadata committed.
 func TestFailedOverwriteLeavesPreviousVersionReadable(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2)
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
 	addMockBackends(lilio, 3)
 

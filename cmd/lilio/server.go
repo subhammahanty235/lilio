@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -139,6 +140,16 @@ func initFromConfig(configPath string) (*storage.Lilio, error) {
 		fmt.Println("  ⚠ Warning: No healthy backends available. Server running in degraded mode.")
 	}
 
+	if sc := cfg.Scrub; sc != nil && sc.Enabled {
+		interval, err := sc.IntervalDuration()
+		if err != nil {
+			return nil, fmt.Errorf("invalid scrub.interval: %w", err)
+		}
+		// Runs for the lifetime of the process; the server has no shutdown
+		// path to hang it off yet.
+		go lio.RunPeriodicScrub(context.Background(), interval, storage.ScrubOptions{Deep: sc.Deep})
+	}
+
 	return lio, nil
 }
 
@@ -262,9 +273,14 @@ func quorumConfig(cfg *config.Config) *storage.QuorumConfig {
 	if q == nil {
 		return nil
 	}
+	if q.R != 0 {
+		fmt.Printf("  ⚠ config sets quorum.R=%d, which is ignored: Lilio has no read quorum.\n", q.R)
+		fmt.Printf("    A chunk is immutable, so one replica matching the metadata checksum is\n")
+		fmt.Printf("    proof enough. Requiring R of them only refused reads of intact data.\n")
+	}
+
 	return &storage.QuorumConfig{
 		N: q.EffectiveN(cfg.Lilio.ReplicationFactor),
 		W: q.W,
-		R: q.R,
 	}
 }

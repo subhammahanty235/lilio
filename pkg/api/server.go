@@ -245,6 +245,11 @@ func (s *Server) handleBucketsOrObjects(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if bucket == "admin" && key == "scrub" {
+		s.handleScrub(w, r)
+		return
+	}
+
 	// Handle unlock endpoint
 	if key == "unlock" && r.Method == http.MethodPost {
 		s.handleUnlock(w, r, bucket)
@@ -312,6 +317,31 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 	}
 	// case delete
 
+}
+
+// handleScrub runs an anti-entropy pass and returns what it found.
+//
+// POST, not GET: a scrub writes data (it restores missing replicas) and is
+// expensive, so it should not be something a crawler or a link click triggers.
+func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "scrub must be triggered with POST")
+		return
+	}
+
+	opts := storage.ScrubOptions{
+		Deep:   r.URL.Query().Get("deep") == "true",
+		DryRun: r.URL.Query().Get("dry_run") == "true",
+	}
+
+	report, err := s.lio.Scrub(r.Context(), opts)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	log.Printf("%s", report)
+	jsonResponse(w, http.StatusOK, report)
 }
 
 func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -456,6 +486,7 @@ func (s *Server) Start() error {
 ║    POST   /{bucket}/unlock     - Unlock encrypted bucket   ║
 ║    GET    /admin/stats         - Storage statistics        ║
 ║    GET    /admin/health        - Backend health status     ║
+║    POST   /admin/scrub         - Repair missing replicas   ║
 ║                                                            ║
 ║  Press Ctrl+C to stop                                      ║
 ╚════════════════════════════════════════════════════════════╝

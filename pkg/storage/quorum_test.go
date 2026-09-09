@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 
 // TestQuorumWriteSuccess tests that writes succeed when quorum is met
 func TestQuorumWriteSuccess(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2) // N=3, W=2, R=2
+	lilio := setupTestLilio(t, 3, 2) // N=3, W=2, R=2
 	defer cleanup(lilio)
 
 	// Add 3 backends
@@ -31,7 +32,7 @@ func TestQuorumWriteSuccess(t *testing.T) {
 
 // TestQuorumWriteFailure tests that writes fail when quorum not met
 func TestQuorumWriteFailure(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2) // N=3, W=2, R=2
+	lilio := setupTestLilio(t, 3, 2) // N=3, W=2, R=2
 	defer cleanup(lilio)
 
 	// Add only 1 backend (insufficient for W=2)
@@ -52,7 +53,7 @@ func TestQuorumWriteFailure(t *testing.T) {
 
 // TestQuorumReadSuccess tests that reads succeed when quorum met
 func TestQuorumReadSuccess(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2)
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
 
 	addMockBackends(lilio, 3)
@@ -78,80 +79,98 @@ func TestQuorumReadSuccess(t *testing.T) {
 	t.Log("✓ Read quorum succeeded with 3/3 nodes")
 }
 
-// TestQuorumReadFailure tests that reads fail when quorum not met
-func TestQuorumReadFailure(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 3, 3) // N=3, W=3, R=3 (requires all nodes)
+// TestReadSucceedsFromLastSurvivingReplica is the behaviour a read quorum used
+// to prevent. Two of three nodes are gone; the third holds a copy whose
+// checksum matches the metadata. That copy is provably the right data, so
+// refusing to serve it - as W+R>N required - cost availability for nothing.
+func TestReadSucceedsFromLastSurvivingReplica(t *testing.T) {
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
-
 	addMockBackends(lilio, 3)
 
-	// Write data with all 3 nodes
-	data := []byte("strict quorum test")
-	_, err := lilio.PutObject(context.Background(), "test-bucket", "strict-key", bytes.NewReader(data), int64(len(data)), "text/plain")
-	if err != nil {
+	data := []byte("one good copy is proof enough")
+	if _, err := lilio.PutObject(context.Background(), "test-bucket", "survivor", bytes.NewReader(data), int64(len(data)), "text/plain"); err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
 
-	// Remove 1 backend to simulate failure
+	lilio.RemoveBackend("mock-backend-1")
 	lilio.RemoveBackend("mock-backend-2")
 
-	// Read should fail (only 2/3 nodes, R=3 requires all)
 	var buf bytes.Buffer
-	err = lilio.GetObject(context.Background(), "test-bucket", "strict-key", &buf)
-	if err == nil {
-		t.Fatal("Read should fail with only 2/3 nodes when R=3")
+	if err := lilio.GetObject(context.Background(), "test-bucket", "survivor", &buf); err != nil {
+		t.Fatalf("Read should succeed from the one intact replica: %v", err)
 	}
-
-	if !contains(err.Error(), "read quorum failed") {
-		t.Errorf("Expected 'read quorum failed' error, got: %v", err)
+	if !bytes.Equal(buf.Bytes(), data) {
+		t.Errorf("Got %q, want %q", buf.Bytes(), data)
 	}
-
-	t.Log("✓ Read correctly failed when quorum not met")
 }
 
-// TestReadRepair tests that read repair fixes stale replicas
-func TestReadRepair(t *testing.T) {
-	lilio := setupTestLilio(t, 3, 2, 2)
+// TestReadFailsWhenNoReplicaIsIntact: a read may only fail when no replica can
+// produce bytes matching the checksum - not merely because too few answered.
+func TestReadFailsWhenNoReplicaIsIntact(t *testing.T) {
+	lilio := setupTestLilio(t, 3, 2)
 	defer cleanup(lilio)
-
 	addMockBackends(lilio, 3)
 
-	// Write initial data
-	data := []byte("original data")
-	meta, err := lilio.PutObject(context.Background(), "test-bucket", "repair-key", bytes.NewReader(data), int64(len(data)), "text/plain")
+	data := []byte("every copy will be ruined")
+	meta, err := lilio.PutObject(context.Background(), "test-bucket", "ruined", bytes.NewReader(data), int64(len(data)), "text/plain")
 	if err != nil {
 		t.Fatalf("Setup failed: %v", err)
 	}
 
-	// Simulate corruption on one backend by overwriting chunk with bad data
-	backend, _ := lilio.Registry.Get("mock-backend-1")
 	chunkID := meta.Chunks[0].ChunkID
-	backend.StoreChunk(context.Background(), chunkID, []byte("corrupted data"))
+	for _, name := range []string{"mock-backend-0", "mock-backend-1", "mock-backend-2"} {
+		backend, _ := lilio.Registry.Get(name)
+		backend.StoreChunk(context.Background(), chunkID, []byte("corrupted"))
+	}
 
-	// Read should trigger read repair
 	var buf bytes.Buffer
-	err = lilio.GetObject(context.Background(), "test-bucket", "repair-key", &buf)
-	if err != nil {
-		t.Fatalf("Read should succeed and trigger repair: %v", err)
+	if err := lilio.GetObject(context.Background(), "test-bucket", "ruined", &buf); err == nil {
+		t.Fatal("Expected the read to fail when no replica matches the checksum")
 	}
-
-	// Give read repair goroutine time to complete
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify repaired data on backend-1
-	repairedData, err := backend.RetrieveChunk(context.Background(), chunkID)
-	if err != nil {
-		t.Fatalf("Failed to retrieve repaired chunk: %v", err)
-	}
-
-	if CalculateChecksum(repairedData) != meta.Chunks[0].Checksum {
-		t.Error("Read repair did not fix corrupted chunk")
-	}
-
-	t.Log("✓ Read repair successfully fixed corrupted replica")
 }
 
-// TestInvalidQuorumConfig tests validation of quorum settings
+// TestReadRepairsCorruptReplicaItPassed: a replica that answers with the wrong
+// bytes on the way to a good one still gets fixed.
+func TestReadRepairsCorruptReplicaItPassed(t *testing.T) {
+	lilio := setupTestLilio(t, 3, 2)
+	defer cleanup(lilio)
+	addMockBackends(lilio, 3)
+
+	data := []byte("one replica will be rotten")
+	meta, err := lilio.PutObject(context.Background(), "test-bucket", "rotten", bytes.NewReader(data), int64(len(data)), "text/plain")
+	if err != nil {
+		t.Fatalf("Setup failed: %v", err)
+	}
+
+	chunkID := meta.Chunks[0].ChunkID
+	first := lilio.orderReplicas(meta.Chunks[0].StorageNodes)[0]
+	backend, _ := lilio.Registry.Get(first)
+	backend.StoreChunk(context.Background(), chunkID, []byte("corrupted"))
+
+	var buf bytes.Buffer
+	if err := lilio.GetObject(context.Background(), "test-bucket", "rotten", &buf); err != nil {
+		t.Fatalf("Read should have fallen through to a good replica: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond) // repair is asynchronous
+	repaired, err := backend.RetrieveChunk(context.Background(), chunkID)
+	if err != nil {
+		t.Fatalf("Could not read the repaired replica: %v", err)
+	}
+	if CalculateChecksum(repaired) != meta.Chunks[0].Checksum {
+		t.Error("The corrupt replica the read passed over was not repaired")
+	}
+}
+
+// Read repair is now covered by TestReadRepairsCorruptReplicaItPassed above.
+// The original test here corrupted an arbitrary replica and expected a read to
+// fix it, which assumed every read contacted every replica. Reads now stop at
+// the first copy matching the checksum, so a corrupt replica the read never
+// reached is not repaired by it - that case belongs to the scrubber, which
+// checks every replica of every chunk whether or not anyone is reading it.
+
+// TestInvalidQuorumConfig tests validation of the replication policy
 func TestInvalidQuorumConfig(t *testing.T) {
 	tests := []struct {
 		name string
@@ -159,14 +178,14 @@ func TestInvalidQuorumConfig(t *testing.T) {
 		want string
 	}{
 		{
-			name: "W+R <= N (allows stale reads)",
-			cfg:  QuorumConfig{N: 3, W: 1, R: 2}, // 1+2 = 3, not > 3
-			want: "invalid quorum",
+			name: "W above N can never be met",
+			cfg:  QuorumConfig{N: 3, W: 4},
+			want: "invalid write quorum",
 		},
 		{
-			name: "W+R <= N (edge case)",
-			cfg:  QuorumConfig{N: 5, W: 2, R: 3}, // 2+3 = 5, not > 5
-			want: "invalid quorum",
+			name: "W below 1 would commit a write nobody accepted",
+			cfg:  QuorumConfig{N: 3, W: 0},
+			want: "invalid write quorum",
 		},
 	}
 
@@ -193,35 +212,30 @@ func TestInvalidQuorumConfig(t *testing.T) {
 		})
 	}
 
-	t.Log("✓ Invalid quorum configurations correctly rejected")
+	t.Log("✓ Invalid replication configurations correctly rejected")
 }
 
 // TestDefaultQuorum verifies default quorum calculation
 func TestDefaultQuorum(t *testing.T) {
 	tests := []struct {
-		rf      int
-		wantW   int
-		wantR   int
-		wantErr bool
+		rf    int
+		wantW int
 	}{
-		{rf: 3, wantW: 2, wantR: 2, wantErr: false}, // (3/2)+1 = 2, 2+2=4 > 3 ✓
-		{rf: 5, wantW: 3, wantR: 3, wantErr: false}, // (5/2)+1 = 3, 3+3=6 > 5 ✓
-		{rf: 1, wantW: 1, wantR: 1, wantErr: false}, // (1/2)+1 = 1, 1+1=2 > 1 ✓ (valid)
+		{rf: 3, wantW: 2}, // a majority of 3
+		{rf: 5, wantW: 3}, // a majority of 5
+		{rf: 1, wantW: 1}, // a single copy must still be written
 	}
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("RF=%d", tt.rf), func(t *testing.T) {
 			q := DefaultQuorum(tt.rf)
 
-			if q.W != tt.wantW || q.R != tt.wantR {
-				t.Errorf("DefaultQuorum(%d) = W:%d, R:%d; want W:%d, R:%d",
-					tt.rf, q.W, q.R, tt.wantW, tt.wantR)
+			if q.N != tt.rf || q.W != tt.wantW {
+				t.Errorf("DefaultQuorum(%d) = N:%d W:%d; want N:%d W:%d",
+					tt.rf, q.N, q.W, tt.rf, tt.wantW)
 			}
-
-			// Verify W+R > N invariant (should always hold for default quorum)
-			if q.W+q.R <= q.N {
-				t.Errorf("DefaultQuorum(%d) violates W+R > N: %d+%d <= %d",
-					tt.rf, q.W, q.R, q.N)
+			if q.W > q.N {
+				t.Errorf("DefaultQuorum(%d) produced an unreachable W: %d > %d", tt.rf, q.W, q.N)
 			}
 		})
 	}
@@ -231,13 +245,13 @@ func TestDefaultQuorum(t *testing.T) {
 
 // Helper functions
 
-func setupTestLilio(t *testing.T, n, w, r int) *Lilio {
+func setupTestLilio(t *testing.T, n, w int) *Lilio {
 	tempDir := t.TempDir()
 	cfg := Config{
 		BasePath:          tempDir,
 		ChunkSize:         1024,
 		ReplicationFactor: n,
-		Quorum:            &QuorumConfig{N: n, W: w, R: r},
+		Quorum:            &QuorumConfig{N: n, W: w},
 		MetadataConfig: &metadata.Config{
 			Type: metadata.StoreTypeMemory,
 		},
@@ -288,18 +302,27 @@ func containsHelper(s, substr string) bool {
 	return false
 }
 
-// MockBackend for testing
+// MockBackend for testing.
+//
+// It is mutex-guarded because a real backend is: writes fan out to replicas
+// concurrently, and read repair and chunk reclamation touch backends from
+// background goroutines after the request that started them has returned.
 type MockBackend struct {
 	name   string
+	mu     sync.RWMutex
 	chunks map[string][]byte
 }
 
 func (m *MockBackend) StoreChunk(ctx context.Context, chunkID string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.chunks[chunkID] = data
 	return nil
 }
 
 func (m *MockBackend) RetrieveChunk(ctx context.Context, chunkID string) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	data, exists := m.chunks[chunkID]
 	if !exists {
 		return nil, fmt.Errorf("chunk not found: %s", chunkID)
@@ -308,6 +331,8 @@ func (m *MockBackend) RetrieveChunk(ctx context.Context, chunkID string) ([]byte
 }
 
 func (m *MockBackend) DeleteChunk(ctx context.Context, chunkID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.chunks, chunkID)
 	return nil
 }
@@ -322,6 +347,8 @@ func (m *MockBackend) Info() BackendInfo {
 }
 
 func (m *MockBackend) Stats(ctx context.Context) (BackendStats, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return BackendStats{
 		ChunksStored: int64(len(m.chunks)),
 		BytesUsed:    0,
@@ -333,11 +360,15 @@ func (m *MockBackend) Health(ctx context.Context) error {
 }
 
 func (m *MockBackend) HasChunk(ctx context.Context, chunkID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	_, exists := m.chunks[chunkID]
 	return exists
 }
 
 func (m *MockBackend) ListChunks(ctx context.Context) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var chunks []string
 	for id := range m.chunks {
 		chunks = append(chunks, id)

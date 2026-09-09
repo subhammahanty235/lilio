@@ -12,6 +12,7 @@ type Config struct {
 	Lilio    LilioConfig     `json:"lilio"`
 	Metadata *MetadataConfig `json:"metadata,omitempty"`
 	Metrics  *MetricsConfig  `json:"metrics,omitempty"`
+	Scrub    *ScrubConfig    `json:"scrub,omitempty"`
 	Storages []StorageConfig `json:"storages"`
 }
 
@@ -24,12 +25,17 @@ type LilioConfig struct {
 	APIPort           int           `json:"api_port"`
 }
 
-// QuorumConfig overrides the replica counts derived from replication_factor.
-// Leave it out to let Lilio pick a majority for both W and R.
+// QuorumConfig overrides the replication policy derived from
+// replication_factor. Leave it out to let Lilio pick a majority write quorum.
 type QuorumConfig struct {
 	N int `json:"N"`
 	W int `json:"W"`
-	R int `json:"R"`
+
+	// R is accepted so that existing config files keep loading, and ignored.
+	// Lilio no longer has a read quorum: chunks are immutable, so one replica
+	// whose bytes match the metadata checksum is proof enough, and demanding R
+	// of them only made objects unreadable that were provably intact.
+	R int `json:"R,omitempty"`
 }
 
 // EffectiveN returns the configured N, or the replication factor when N is
@@ -60,6 +66,22 @@ type EtcdMetadataConfig struct {
 	DialTimeout string   `json:"dial_timeout,omitempty"` // Go duration, e.g. "5s"
 	Username    string   `json:"username,omitempty"`
 	Password    string   `json:"password,omitempty"`
+}
+
+// ScrubConfig turns on a periodic anti-entropy pass. Left out, scrubbing only
+// happens when asked for (lilio scrub, or POST /admin/scrub).
+type ScrubConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Interval string `json:"interval"`       // Go duration, e.g. "6h"
+	Deep     bool   `json:"deep,omitempty"` // verify checksums, not just presence
+}
+
+// IntervalDuration parses Interval, defaulting to 6h.
+func (s *ScrubConfig) IntervalDuration() (time.Duration, error) {
+	if s.Interval == "" {
+		return 6 * time.Hour, nil
+	}
+	return time.ParseDuration(s.Interval)
 }
 
 // MetricsConfig controls the metrics collector. Type is "prometheus"
@@ -157,14 +179,11 @@ func (c *Config) Validate() error {
 		// Checked here are the bounds that would otherwise fail silently at
 		// runtime: a W above N can never be reached, so every write would fail.
 		n := q.EffectiveN(c.Lilio.ReplicationFactor)
-		if q.W < 1 || q.R < 1 {
-			return fmt.Errorf("quorum W and R must both be at least 1")
+		if q.W < 1 {
+			return fmt.Errorf("quorum W must be at least 1")
 		}
 		if q.W > n {
 			return fmt.Errorf("quorum W(%d) cannot exceed N(%d)", q.W, n)
-		}
-		if q.R > n {
-			return fmt.Errorf("quorum R(%d) cannot exceed N(%d)", q.R, n)
 		}
 	}
 
@@ -180,6 +199,16 @@ func (c *Config) Validate() error {
 			}
 		default:
 			return fmt.Errorf("unknown metadata type: %s", m.Type)
+		}
+	}
+
+	if sc := c.Scrub; sc != nil && sc.Enabled {
+		d, err := sc.IntervalDuration()
+		if err != nil {
+			return fmt.Errorf("invalid scrub.interval: %w", err)
+		}
+		if d < time.Minute {
+			return fmt.Errorf("scrub.interval must be at least 1m, got %s", d)
 		}
 	}
 

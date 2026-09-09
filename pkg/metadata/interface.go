@@ -61,12 +61,24 @@ type BucketMetadata struct {
 }
 
 type ChunkInfo struct {
-	ChunkID      string   `json:"chunk_id"`
-	ChunkIndex   int      `json:"chunk_index"`
-	Size         int64    `json:"size"`
-	Checksum     string   `json:"checksum"`
+	ChunkID    string `json:"chunk_id"`
+	ChunkIndex int    `json:"chunk_index"`
+	Size       int64  `json:"size"`
+	Checksum   string `json:"checksum"`
+
+	// StorageNodes is where this chunk *belongs*: the full replica set chosen
+	// from the hash ring at write time, including any node that was down and
+	// did not receive it.
+	//
+	// It deliberately records intent rather than outcome. If it only listed the
+	// nodes that acknowledged the write, then a chunk that reached two of three
+	// replicas would look complete - there would be no expectation for reality
+	// to fall short of, and under-replication would be undetectable. Storing
+	// intent is what gives the scrubber something to compare against.
+	//
+	// Which of these nodes actually holds the chunk right now is not stored,
+	// because it would be stale the moment a disk failed. The scrubber asks.
 	StorageNodes []string `json:"storage_nodes"`
-	Version      int64    `json:"version"`
 }
 
 type ObjectMetadata struct {

@@ -210,7 +210,6 @@ func BenchmarkMetadataSave(b *testing.B) {
 				Size:         1024 * 1024,
 				Checksum:     "chunk-checksum",
 				StorageNodes: []string{"node-1", "node-2", "node-3"},
-				Version:      time.Now().UnixNano(),
 			},
 		},
 		CreatedAt:   time.Now(),
@@ -248,7 +247,6 @@ func BenchmarkMetadataGet(b *testing.B) {
 				Size:         1024 * 1024,
 				Checksum:     "chunk-checksum",
 				StorageNodes: []string{"node-1", "node-2", "node-3"},
-				Version:      time.Now().UnixNano(),
 			},
 		},
 		CreatedAt:   time.Now(),
@@ -391,7 +389,7 @@ func setupBenchLilio(b *testing.B, n, w, r int) *Lilio {
 		BasePath:          tempDir,
 		ChunkSize:         1024 * 1024, // 1MB chunks
 		ReplicationFactor: n,
-		Quorum:            &QuorumConfig{N: n, W: w, R: r},
+		Quorum:            &QuorumConfig{N: n, W: w},
 		MetadataConfig: &metadata.Config{
 			Type: metadata.StoreTypeMemory,
 		},

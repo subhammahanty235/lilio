@@ -20,20 +20,33 @@ import (
 	"github.com/subhammahanty235/lilio/pkg/utils"
 )
 
+// QuorumConfig is the replication policy: how many copies of a chunk exist,
+// and how many must be written before the write is considered durable.
+//
+// There is deliberately no read quorum. A read quorum exists to solve one
+// problem - deciding which of several differing replicas of a mutable value is
+// current - and Lilio does not have that problem. A chunk ID is minted from a
+// fresh object ID on every PUT and is never overwritten, so every copy of a
+// chunk is either byte-identical to the others or damaged, and the checksum in
+// the metadata already says which. Requiring R replicas to agree added nothing
+// the checksum did not already guarantee, while making an object unreadable
+// whenever fewer than R nodes were reachable - even with an intact, verified
+// copy sitting on one of them.
 type QuorumConfig struct {
+	// N is the replication factor: how many nodes a chunk belongs on.
 	N int
-	R int
+	// W is the write quorum: how many of those must accept a chunk before the
+	// write is allowed to commit. It is a real durability threshold - the
+	// number of independent failures the write can survive is N-W.
 	W int
 }
 
+// DefaultQuorum derives a majority write quorum from the replication factor.
 func DefaultQuorum(rf int) QuorumConfig {
-	quorum := (rf / 2) + 1
 	return QuorumConfig{
 		N: rf,
-		R: quorum,
-		W: quorum,
+		W: (rf / 2) + 1,
 	}
-
 }
 
 // backgroundOpTimeout bounds work that continues after a request has been
@@ -113,8 +126,11 @@ func NewLilioInstance(cfg Config) (*Lilio, error) {
 	var quorum QuorumConfig
 	if cfg.Quorum != nil {
 		quorum = *cfg.Quorum
-		if quorum.W+quorum.R <= quorum.N {
-			return nil, fmt.Errorf("invalid quorum: W(%d) + R(%d) must be > N(%d)", quorum.W, quorum.R, quorum.N)
+		if quorum.N < 1 {
+			return nil, fmt.Errorf("invalid replication: N(%d) must be at least 1", quorum.N)
+		}
+		if quorum.W < 1 || quorum.W > quorum.N {
+			return nil, fmt.Errorf("invalid write quorum: W(%d) must be between 1 and N(%d)", quorum.W, quorum.N)
 		}
 	} else {
 		quorum = DefaultQuorum(cfg.ReplicationFactor)
@@ -147,7 +163,7 @@ func NewLilioInstance(cfg Config) (*Lilio, error) {
 
 	fmt.Printf("Lilio initialized:\n")
 	fmt.Printf("  - Chunk size: %d KB\n", cfg.ChunkSize/1024)
-	fmt.Printf("  - Replication: N=%d, W=%d, R=%d\n", quorum.N, quorum.W, quorum.R)
+	fmt.Printf("  - Replication: N=%d, W=%d\n", quorum.N, quorum.W)
 	fmt.Printf("  - Using: Consistent Hashing\n")
 	fmt.Printf("  - Metrics: %s\n", metricsCollector.Type())
 	return obj, nil
@@ -242,6 +258,21 @@ func (s *Lilio) SelectNodesForChunk(chunkId string) []StorageBackend {
 		}
 	}
 
+	return selected
+}
+
+// onlineBackends resolves node names to the backends that are currently up.
+// Names that are unknown or offline are skipped rather than substituted: the
+// chunk still belongs on them, and the scrubber will place it there once they
+// come back.
+func (s *Lilio) onlineBackends(names []string) []StorageBackend {
+	var selected []StorageBackend
+	for _, name := range names {
+		backend, err := s.Registry.Get(name)
+		if err == nil && backend.Info().Status == StatusOnline {
+			selected = append(selected, backend)
+		}
+	}
 	return selected
 }
 
@@ -468,8 +499,16 @@ func (s *Lilio) PutObject(ctx context.Context, bucket, key string, reader io.Rea
 		chunkId := fmt.Sprintf("%s_chunk_%d", objectId, chunkIndex)
 		chunkChecksum := CalculateChecksum(chunkData)
 
-		// select the target nodes using consistent hashing
-		targetNodes := s.SelectNodesForChunk(chunkId)
+		// Where this chunk belongs, from the ring. This is recorded as-is, even
+		// if some of these nodes turn out to be down: it is the expectation the
+		// scrubber will later hold the cluster to.
+		intendedNodes := s.HashRing.GetNodes(chunkId, s.ReplicationFactor)
+		if len(intendedNodes) == 0 {
+			return nil, fmt.Errorf("no backends configured for chunk %d", chunkIndex)
+		}
+
+		// Of those, the ones we can actually write to right now.
+		targetNodes := s.onlineBackends(intendedNodes)
 		if len(targetNodes) == 0 {
 			return nil, fmt.Errorf("no healthy backends available for chunk %d", chunkIndex)
 		}
@@ -478,8 +517,6 @@ func (s *Lilio) PutObject(ctx context.Context, bucket, key string, reader io.Rea
 		var successfulNodes []string
 		var wg sync.WaitGroup
 		var mu sync.Mutex
-
-		version := time.Now().UnixNano()
 
 		for _, node := range targetNodes {
 			wg.Add(1)
@@ -506,16 +543,21 @@ func (s *Lilio) PutObject(ctx context.Context, bucket, key string, reader io.Rea
 		}
 
 		sort.Strings(successfulNodes)
+		sort.Strings(intendedNodes)
 		chunkInfo := metadata.ChunkInfo{
 			ChunkID:      chunkId,
 			ChunkIndex:   chunkIndex,
 			Size:         int64(originalChunkSize),
 			Checksum:     chunkChecksum,
-			StorageNodes: successfulNodes,
-			Version:      version,
+			StorageNodes: intendedNodes,
 		}
 		chunkInfos = append(chunkInfos, chunkInfo)
-		fmt.Printf("  ✓ Chunk %d: %d bytes → stored on %v\n", chunkIndex, originalChunkSize, successfulNodes)
+		if len(successfulNodes) < len(intendedNodes) {
+			fmt.Printf("  ⚠ Chunk %d: %d bytes → stored on %v (under-replicated; belongs on %v)\n",
+				chunkIndex, originalChunkSize, successfulNodes, intendedNodes)
+		} else {
+			fmt.Printf("  ✓ Chunk %d: %d bytes → stored on %v\n", chunkIndex, originalChunkSize, successfulNodes)
+		}
 
 		for _, nodename := range successfulNodes {
 			s.Metrics.RecordChunkStored(nodename, int64(originalChunkSize))
@@ -687,83 +729,103 @@ func (s *Lilio) GetObject(ctx context.Context, bucket, key string, writer io.Wri
 	return nil
 }
 
-type ChunkResponse struct {
-	Data     []byte
-	Checksum string
-	NodeName string
-	Valid    bool
-}
-
-func (s *Lilio) retrieveChunk(ctx context.Context, chunkInfo metadata.ChunkInfo) ([]byte, error) {
-	var response []ChunkResponse
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for _, nodeName := range chunkInfo.StorageNodes {
-		wg.Add(1)
-		go func(name string) {
-			defer wg.Done()
-			backend, err := s.Registry.Get(name)
-			if err != nil {
-				return
-			}
-			data, err := backend.RetrieveChunk(ctx, chunkInfo.ChunkID)
-			if err != nil {
-				return
-			}
-
-			// Record chunk retrieval
-			s.Metrics.RecordChunkRetrieved(name, int64(len(data)))
-
-			checksum := CalculateChecksum(data)
-			valid := checksum == chunkInfo.Checksum
-			mu.Lock()
-			response = append(response, ChunkResponse{
-				Data:     data,
-				Checksum: checksum,
-				NodeName: name,
-				Valid:    valid,
-			})
-			mu.Unlock()
-		}(nodeName)
-	}
-	wg.Wait()
-
-	// Record quorum read metrics
-	success := len(response) >= s.Quorum.R
-	s.Metrics.RecordQuorumRead(success, len(chunkInfo.StorageNodes), len(response))
-
-	if !success {
-		return nil, fmt.Errorf("read quorum failed: got %d/%d nodes", len(response), s.Quorum.R)
-	}
-
-	var validResponses []ChunkResponse
-	var staleNodes []string
-	for _, resp := range response {
-		if resp.Valid {
-			validResponses = append(validResponses, resp)
-		} else {
-			staleNodes = append(staleNodes, resp.NodeName)
-		}
-	}
-	if len(validResponses) == 0 {
-		return nil, fmt.Errorf("no valid chunk data found (all checksums failed)")
-	}
-	if len(staleNodes) > 0 {
-		go s.readRepair(chunkInfo.ChunkID, validResponses[0].Data, staleNodes)
-
-	}
-	fmt.Printf("    Quorum R=%d/%d, valid=%d, repaired=%d\n",
-		len(response), s.Quorum.R, len(validResponses), len(staleNodes))
-
-	return validResponses[0].Data, nil
-}
-
-// readRepair rewrites a chunk onto replicas that returned the wrong bytes.
+// retrieveChunk returns a chunk's bytes from the first replica that can supply
+// a copy matching the checksum recorded in the metadata.
 //
-// It runs detached from the read that triggered it: the caller's context is
-// finished (or nearly) by the time this goroutine gets to work, so using it
-// would cancel almost every repair before it started.
+// It reads replicas one at a time rather than fanning out to all of them. The
+// previous version queried every replica on every read and then required R of
+// them to answer, which cost N times the bandwidth of the data being read and
+// still refused to serve a verified copy when fewer than R nodes were up. Since
+// the checksum is what establishes correctness, one matching copy is proof
+// enough, and the rest of the reads are waste.
+//
+// Replicas are tried in the order given by orderReplicas, so a node believed to
+// be up and a backend marked as preferred are consulted first.
+func (s *Lilio) retrieveChunk(ctx context.Context, chunkInfo metadata.ChunkInfo) ([]byte, error) {
+	candidates := s.orderReplicas(chunkInfo.StorageNodes)
+
+	var corrupt []string
+	var unreachable []string
+	attempted := 0
+
+	for _, name := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		backend, err := s.Registry.Get(name)
+		if err != nil {
+			unreachable = append(unreachable, name)
+			continue
+		}
+		attempted++
+
+		data, err := backend.RetrieveChunk(ctx, chunkInfo.ChunkID)
+		if err != nil {
+			unreachable = append(unreachable, name)
+			continue
+		}
+
+		if CalculateChecksum(data) != chunkInfo.Checksum {
+			corrupt = append(corrupt, name)
+			continue
+		}
+
+		s.Metrics.RecordChunkRetrieved(name, int64(len(data)))
+		s.Metrics.RecordQuorumRead(true, attempted, 1)
+
+		// Any replica that answered with the wrong bytes on the way here is
+		// worth fixing now that a good copy is in hand. Replicas that simply
+		// did not answer are left to the scrubber, which can tell a node that
+		// is missing a chunk from one that is merely unreachable right now.
+		if len(corrupt) > 0 {
+			go s.readRepair(chunkInfo.ChunkID, data, corrupt)
+		}
+
+		return data, nil
+	}
+
+	s.Metrics.RecordQuorumRead(false, attempted, 0)
+	return nil, fmt.Errorf(
+		"chunk %s: no replica could supply data matching its checksum (unreachable: %v, corrupt: %v)",
+		chunkInfo.ChunkID, unreachable, corrupt)
+}
+
+// orderReplicas sorts a chunk's replica set into the order they should be
+// tried: nodes currently believed to be up first, then by backend priority, so
+// a fast local disk is preferred over a slow remote one.
+func (s *Lilio) orderReplicas(names []string) []string {
+	type candidate struct {
+		name     string
+		online   bool
+		priority int
+	}
+
+	candidates := make([]candidate, 0, len(names))
+	for _, name := range names {
+		c := candidate{name: name, priority: int(^uint(0) >> 1)} // unknown backends sort last
+		if backend, err := s.Registry.Get(name); err == nil {
+			info := backend.Info()
+			c.online = info.Status == StatusOnline
+			c.priority = info.Priority
+		}
+		candidates = append(candidates, c)
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].online != candidates[j].online {
+			return candidates[i].online
+		}
+		return candidates[i].priority < candidates[j].priority
+	})
+
+	ordered := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		ordered = append(ordered, c.name)
+	}
+	return ordered
+}
+
 func (s *Lilio) readRepair(chunkId string, data []byte, staleNodes []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundOpTimeout)
 	defer cancel()
