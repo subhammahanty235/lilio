@@ -1,6 +1,7 @@
 package metadata
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -28,26 +29,27 @@ func NewTestSuite(t *testing.T, store MetadataStore) *MetadataStoreTestSuite {
 func (s *MetadataStoreTestSuite) TestBucketLifecycle() {
 	t := s.t
 	store := s.Store
+	ctx := context.Background()
 
 	// 1. Create bucket
-	err := store.CreateBucket("test-bucket")
+	err := store.CreateBucket(ctx, "test-bucket")
 	if err != nil {
 		t.Fatalf("Failed to create bucket: %v", err)
 	}
 
 	// 2. Bucket should exist
-	if !store.BucketExists("test-bucket") {
+	if !store.BucketExists(ctx, "test-bucket") {
 		t.Error("Bucket should exist after creation")
 	}
 
 	// 3. Duplicate create should fail
-	err = store.CreateBucket("test-bucket")
+	err = store.CreateBucket(ctx, "test-bucket")
 	if err == nil {
 		t.Error("Creating duplicate bucket should fail")
 	}
 
 	// 4. Get bucket metadata
-	bucket, err := store.GetBucket("test-bucket")
+	bucket, err := store.GetBucket(ctx, "test-bucket")
 	if err != nil {
 		t.Fatalf("Failed to get bucket: %v", err)
 	}
@@ -59,7 +61,7 @@ func (s *MetadataStoreTestSuite) TestBucketLifecycle() {
 	}
 
 	// 5. List buckets
-	buckets, err := store.ListBuckets()
+	buckets, err := store.ListBuckets(ctx)
 	if err != nil {
 		t.Fatalf("Failed to list buckets: %v", err)
 	}
@@ -87,22 +89,22 @@ func (s *MetadataStoreTestSuite) TestBucketLifecycle() {
 		CreatedAt:   time.Now(),
 		ContentType: "text/plain",
 	}
-	store.SaveObjectMetadata(meta)
+	store.SaveObjectMetadata(ctx, meta)
 
-	err = store.DeleteBucket("test-bucket")
+	err = store.DeleteBucket(ctx, "test-bucket")
 	if err == nil {
 		t.Error("Deleting non-empty bucket should fail")
 	}
 
 	// 7. Delete object then bucket
-	store.DeleteObjectMetadata("test-bucket", "test-key")
-	err = store.DeleteBucket("test-bucket")
+	store.DeleteObjectMetadata(ctx, "test-bucket", "test-key")
+	err = store.DeleteBucket(ctx, "test-bucket")
 	if err != nil {
 		t.Errorf("Failed to delete empty bucket: %v", err)
 	}
 
 	// 8. Bucket should not exist
-	if store.BucketExists("test-bucket") {
+	if store.BucketExists(ctx, "test-bucket") {
 		t.Error("Bucket should not exist after deletion")
 	}
 
@@ -113,6 +115,7 @@ func (s *MetadataStoreTestSuite) TestBucketLifecycle() {
 func (s *MetadataStoreTestSuite) TestBucketEncryption() {
 	t := s.t
 	store := s.Store
+	ctx := context.Background()
 
 	// Create encrypted bucket
 	encConfig := EncryptionConfig{
@@ -122,13 +125,13 @@ func (s *MetadataStoreTestSuite) TestBucketEncryption() {
 		KeyHash:   "testhash123",
 	}
 
-	err := store.CreateBucketWithEncryption("encrypted-bucket", encConfig)
+	err := store.CreateBucketWithEncryption(ctx, "encrypted-bucket", encConfig)
 	if err != nil {
 		t.Fatalf("Failed to create encrypted bucket: %v", err)
 	}
 
 	// Verify encryption settings
-	isEncrypted, err := store.IsBucketEncrypted("encrypted-bucket")
+	isEncrypted, err := store.IsBucketEncrypted(ctx, "encrypted-bucket")
 	if err != nil {
 		t.Fatalf("Failed to check encryption: %v", err)
 	}
@@ -137,7 +140,7 @@ func (s *MetadataStoreTestSuite) TestBucketEncryption() {
 	}
 
 	// Get encryption config
-	enc, err := store.GetBucketEncryption("encrypted-bucket")
+	enc, err := store.GetBucketEncryption(ctx, "encrypted-bucket")
 	if err != nil {
 		t.Fatalf("Failed to get encryption config: %v", err)
 	}
@@ -149,7 +152,7 @@ func (s *MetadataStoreTestSuite) TestBucketEncryption() {
 	}
 
 	// Cleanup
-	store.DeleteBucket("encrypted-bucket")
+	store.DeleteBucket(ctx, "encrypted-bucket")
 
 	t.Logf("✓ Bucket encryption tests passed for %s backend", store.Type())
 }
@@ -158,9 +161,10 @@ func (s *MetadataStoreTestSuite) TestBucketEncryption() {
 func (s *MetadataStoreTestSuite) TestObjectLifecycle() {
 	t := s.t
 	store := s.Store
+	ctx := context.Background()
 
 	// Setup: Create bucket
-	store.CreateBucket("obj-bucket")
+	store.CreateBucket(ctx, "obj-bucket")
 
 	// 1. Save object metadata
 	meta := &ObjectMetadata{
@@ -192,13 +196,13 @@ func (s *MetadataStoreTestSuite) TestObjectLifecycle() {
 		Encrypted:   false,
 	}
 
-	err := store.SaveObjectMetadata(meta)
+	err := store.SaveObjectMetadata(ctx, meta)
 	if err != nil {
 		t.Fatalf("Failed to save object metadata: %v", err)
 	}
 
 	// 2. Get object metadata
-	retrieved, err := store.GetObjectMetadata("obj-bucket", "photos/vacation.jpg")
+	retrieved, err := store.GetObjectMetadata(ctx, "obj-bucket", "photos/vacation.jpg")
 	if err != nil {
 		t.Fatalf("Failed to get object metadata: %v", err)
 	}
@@ -217,7 +221,7 @@ func (s *MetadataStoreTestSuite) TestObjectLifecycle() {
 	}
 
 	// 3. List objects
-	objects, err := store.ListObjects("obj-bucket", "")
+	objects, err := listKeys(t, store, "obj-bucket", "")
 	if err != nil {
 		t.Fatalf("Failed to list objects: %v", err)
 	}
@@ -229,20 +233,20 @@ func (s *MetadataStoreTestSuite) TestObjectLifecycle() {
 	}
 
 	// 4. List with prefix
-	store.SaveObjectMetadata(&ObjectMetadata{
+	store.SaveObjectMetadata(ctx, &ObjectMetadata{
 		ObjectID: "obj-124",
 		Bucket:   "obj-bucket",
 		Key:      "photos/beach.jpg",
 		Size:     500,
 	})
-	store.SaveObjectMetadata(&ObjectMetadata{
+	store.SaveObjectMetadata(ctx, &ObjectMetadata{
 		ObjectID: "obj-125",
 		Bucket:   "obj-bucket",
 		Key:      "documents/report.pdf",
 		Size:     1000,
 	})
 
-	photosOnly, err := store.ListObjects("obj-bucket", "photos/")
+	photosOnly, err := listKeys(t, store, "obj-bucket", "photos/")
 	if err != nil {
 		t.Fatalf("Failed to list with prefix: %v", err)
 	}
@@ -252,31 +256,31 @@ func (s *MetadataStoreTestSuite) TestObjectLifecycle() {
 
 	// 5. Update object metadata (overwrite)
 	meta.Size = 2048000
-	err = store.SaveObjectMetadata(meta)
+	err = store.SaveObjectMetadata(ctx, meta)
 	if err != nil {
 		t.Fatalf("Failed to update metadata: %v", err)
 	}
 
-	updated, _ := store.GetObjectMetadata("obj-bucket", "photos/vacation.jpg")
+	updated, _ := store.GetObjectMetadata(ctx, "obj-bucket", "photos/vacation.jpg")
 	if updated.Size != 2048000 {
 		t.Errorf("Update failed: expected size 2048000, got %d", updated.Size)
 	}
 
 	// 6. Delete object
-	err = store.DeleteObjectMetadata("obj-bucket", "photos/vacation.jpg")
+	err = store.DeleteObjectMetadata(ctx, "obj-bucket", "photos/vacation.jpg")
 	if err != nil {
 		t.Fatalf("Failed to delete object: %v", err)
 	}
 
-	_, err = store.GetObjectMetadata("obj-bucket", "photos/vacation.jpg")
+	_, err = store.GetObjectMetadata(ctx, "obj-bucket", "photos/vacation.jpg")
 	if err == nil {
 		t.Error("Getting deleted object should fail")
 	}
 
 	// Cleanup
-	store.DeleteObjectMetadata("obj-bucket", "photos/beach.jpg")
-	store.DeleteObjectMetadata("obj-bucket", "documents/report.pdf")
-	store.DeleteBucket("obj-bucket")
+	store.DeleteObjectMetadata(ctx, "obj-bucket", "photos/beach.jpg")
+	store.DeleteObjectMetadata(ctx, "obj-bucket", "documents/report.pdf")
+	store.DeleteBucket(ctx, "obj-bucket")
 
 	t.Logf("✓ Object lifecycle tests passed for %s backend", store.Type())
 }
@@ -285,8 +289,9 @@ func (s *MetadataStoreTestSuite) TestObjectLifecycle() {
 func (s *MetadataStoreTestSuite) TestConcurrency() {
 	t := s.t
 	store := s.Store
+	ctx := context.Background()
 
-	store.CreateBucket("concurrent-bucket")
+	store.CreateBucket(ctx, "concurrent-bucket")
 
 	// Concurrent writes
 	done := make(chan bool)
@@ -298,7 +303,7 @@ func (s *MetadataStoreTestSuite) TestConcurrency() {
 				Key:      fmt.Sprintf("key-%d", id),
 				Size:     int64(id * 100),
 			}
-			store.SaveObjectMetadata(meta)
+			store.SaveObjectMetadata(ctx, meta)
 			done <- true
 		}(i)
 	}
@@ -309,16 +314,16 @@ func (s *MetadataStoreTestSuite) TestConcurrency() {
 	}
 
 	// Verify all objects saved
-	objects, _ := store.ListObjects("concurrent-bucket", "")
+	objects, _ := listKeys(t, store, "concurrent-bucket", "")
 	if len(objects) != 10 {
 		t.Errorf("Expected 10 objects after concurrent writes, got %d", len(objects))
 	}
 
 	// Cleanup
 	for i := 0; i < 10; i++ {
-		store.DeleteObjectMetadata("concurrent-bucket", fmt.Sprintf("key-%d", i))
+		store.DeleteObjectMetadata(ctx, "concurrent-bucket", fmt.Sprintf("key-%d", i))
 	}
-	store.DeleteBucket("concurrent-bucket")
+	store.DeleteBucket(ctx, "concurrent-bucket")
 
 	t.Logf("✓ Concurrency tests passed for %s backend", store.Type())
 }
@@ -327,8 +332,9 @@ func (s *MetadataStoreTestSuite) TestConcurrency() {
 func (s *MetadataStoreTestSuite) TestHealth() {
 	t := s.t
 	store := s.Store
+	ctx := context.Background()
 
-	err := store.Health()
+	err := store.Health(ctx)
 	if err != nil {
 		t.Errorf("Health check failed: %v", err)
 	}
@@ -348,9 +354,10 @@ func (s *MetadataStoreTestSuite) TestHealth() {
 func (s *MetadataStoreTestSuite) TestKeyEncoding() {
 	t := s.t
 	store := s.Store
+	ctx := context.Background()
 
 	const bucket = "key-encoding-bucket"
-	if err := store.CreateBucket(bucket); err != nil {
+	if err := store.CreateBucket(ctx, bucket); err != nil {
 		t.Fatalf("Failed to create bucket: %v", err)
 	}
 
@@ -377,14 +384,14 @@ func (s *MetadataStoreTestSuite) TestKeyEncoding() {
 			Key:      key,
 			Size:     int64(i + 1),
 		}
-		if err := store.SaveObjectMetadata(meta); err != nil {
+		if err := store.SaveObjectMetadata(ctx, meta); err != nil {
 			t.Fatalf("Failed to save key %q: %v", key, err)
 		}
 	}
 
 	// Every key must read back its own metadata.
 	for i, key := range keys {
-		got, err := store.GetObjectMetadata(bucket, key)
+		got, err := store.GetObjectMetadata(ctx, bucket, key)
 		if err != nil {
 			t.Errorf("Failed to get key %q: %v", key, err)
 			continue
@@ -399,7 +406,7 @@ func (s *MetadataStoreTestSuite) TestKeyEncoding() {
 	}
 
 	// Listing must return every key verbatim, with nothing invented or lost.
-	listed, err := store.ListObjects(bucket, "")
+	listed, err := listKeys(t, store, bucket, "")
 	if err != nil {
 		t.Fatalf("Failed to list objects: %v", err)
 	}
@@ -417,7 +424,7 @@ func (s *MetadataStoreTestSuite) TestKeyEncoding() {
 	}
 
 	// Prefix filtering must work on the real key, not on an encoded form.
-	logs, err := store.ListObjects(bucket, "logs/")
+	logs, err := listKeys(t, store, bucket, "logs/")
 	if err != nil {
 		t.Fatalf("Failed to list with prefix: %v", err)
 	}
@@ -426,11 +433,11 @@ func (s *MetadataStoreTestSuite) TestKeyEncoding() {
 	}
 
 	for _, key := range keys {
-		if err := store.DeleteObjectMetadata(bucket, key); err != nil {
+		if err := store.DeleteObjectMetadata(ctx, bucket, key); err != nil {
 			t.Errorf("Failed to delete key %q: %v", key, err)
 		}
 	}
-	if err := store.DeleteBucket(bucket); err != nil {
+	if err := store.DeleteBucket(ctx, bucket); err != nil {
 		t.Errorf("Failed to delete bucket: %v", err)
 	}
 
@@ -443,23 +450,24 @@ func (s *MetadataStoreTestSuite) TestKeyEncoding() {
 func (s *MetadataStoreTestSuite) TestNotFoundErrors() {
 	t := s.t
 	store := s.Store
+	ctx := context.Background()
 
 	const bucket = "sentinel-bucket"
-	if err := store.CreateBucket(bucket); err != nil {
+	if err := store.CreateBucket(ctx, bucket); err != nil {
 		t.Fatalf("Failed to create bucket: %v", err)
 	}
-	defer store.DeleteBucket(bucket)
+	defer store.DeleteBucket(ctx, bucket)
 
-	if _, err := store.GetObjectMetadata(bucket, "no-such-object"); !errors.Is(err, ErrObjectNotFound) {
+	if _, err := store.GetObjectMetadata(ctx, bucket, "no-such-object"); !errors.Is(err, ErrObjectNotFound) {
 		t.Errorf("GetObjectMetadata on a missing object: got %v, want ErrObjectNotFound", err)
 	}
-	if err := store.DeleteObjectMetadata(bucket, "no-such-object"); !errors.Is(err, ErrObjectNotFound) {
+	if err := store.DeleteObjectMetadata(ctx, bucket, "no-such-object"); !errors.Is(err, ErrObjectNotFound) {
 		t.Errorf("DeleteObjectMetadata on a missing object: got %v, want ErrObjectNotFound", err)
 	}
-	if _, err := store.GetBucket("no-such-bucket"); !errors.Is(err, ErrBucketNotFound) {
+	if _, err := store.GetBucket(ctx, "no-such-bucket"); !errors.Is(err, ErrBucketNotFound) {
 		t.Errorf("GetBucket on a missing bucket: got %v, want ErrBucketNotFound", err)
 	}
-	if err := store.CreateBucket(bucket); !errors.Is(err, ErrBucketExists) {
+	if err := store.CreateBucket(ctx, bucket); !errors.Is(err, ErrBucketExists) {
 		t.Errorf("CreateBucket on an existing bucket: got %v, want ErrBucketExists", err)
 	}
 
@@ -474,6 +482,8 @@ func (s *MetadataStoreTestSuite) RunAll() {
 	s.TestObjectLifecycle()
 	s.TestKeyEncoding()
 	s.TestNotFoundErrors()
+	s.TestListPagination()
+	s.TestCompareAndSave()
 	s.TestConcurrency()
 }
 
@@ -557,9 +567,10 @@ func TestFactory(t *testing.T) {
 
 // Benchmark tests
 func BenchmarkLocalStore_SaveObject(b *testing.B) {
+	ctx := context.Background()
 	store, _ := NewLocalStore(b.TempDir())
 	defer store.Close()
-	store.CreateBucket("bench-bucket")
+	store.CreateBucket(ctx, "bench-bucket")
 
 	meta := &ObjectMetadata{
 		ObjectID:    "bench-obj",
@@ -574,14 +585,15 @@ func BenchmarkLocalStore_SaveObject(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		store.SaveObjectMetadata(meta)
+		store.SaveObjectMetadata(ctx, meta)
 	}
 }
 
 func BenchmarkMemoryStore_SaveObject(b *testing.B) {
+	ctx := context.Background()
 	store := NewMemoryStore()
 	defer store.Close()
-	store.CreateBucket("bench-bucket")
+	store.CreateBucket(ctx, "bench-bucket")
 
 	meta := &ObjectMetadata{
 		ObjectID:    "bench-obj",
@@ -596,6 +608,149 @@ func BenchmarkMemoryStore_SaveObject(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		store.SaveObjectMetadata(meta)
+		store.SaveObjectMetadata(ctx, meta)
 	}
+}
+
+// listKeys drains every page of a listing, so tests can keep asserting on a
+// simple slice while the store itself pages.
+func listKeys(t *testing.T, store MetadataStore, bucket, prefix string) ([]string, error) {
+	t.Helper()
+
+	var all []string
+	opts := ListOptions{Prefix: prefix}
+	for {
+		page, err := store.ListObjects(context.Background(), bucket, opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page.Keys...)
+		if !page.Truncated {
+			return all, nil
+		}
+		opts.After = page.NextAfter
+	}
+}
+
+// Pagination must return every key exactly once, in order, across pages.
+func (s *MetadataStoreTestSuite) TestListPagination() {
+	t := s.t
+	store := s.Store
+	ctx := context.Background()
+
+	const bucket = "paging-bucket"
+	if err := store.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
+
+	const total = 25
+	for i := 0; i < total; i++ {
+		meta := &ObjectMetadata{
+			ObjectID: fmt.Sprintf("obj-%02d", i),
+			Bucket:   bucket,
+			Key:      fmt.Sprintf("key-%02d", i),
+		}
+		if err := store.SaveObjectMetadata(ctx, meta); err != nil {
+			t.Fatalf("Failed to save: %v", err)
+		}
+	}
+
+	var seen []string
+	pages := 0
+	opts := ListOptions{Limit: 10}
+	for {
+		page, err := store.ListObjects(ctx, bucket, opts)
+		if err != nil {
+			t.Fatalf("ListObjects failed: %v", err)
+		}
+		pages++
+		if len(page.Keys) > 10 {
+			t.Fatalf("Page returned %d keys, limit was 10", len(page.Keys))
+		}
+		seen = append(seen, page.Keys...)
+		if !page.Truncated {
+			break
+		}
+		opts.After = page.NextAfter
+		if pages > 10 {
+			t.Fatal("Listing did not terminate")
+		}
+	}
+
+	if len(seen) != total {
+		t.Errorf("Paged listing returned %d keys, want %d", len(seen), total)
+	}
+	if pages < 3 {
+		t.Errorf("Expected at least 3 pages for %d keys at limit 10, got %d", total, pages)
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] <= seen[i-1] {
+			t.Fatalf("Keys out of order or duplicated: %q then %q", seen[i-1], seen[i])
+		}
+	}
+
+	for i := 0; i < total; i++ {
+		store.DeleteObjectMetadata(ctx, bucket, fmt.Sprintf("key-%02d", i))
+	}
+	store.DeleteBucket(ctx, bucket)
+	t.Logf("\u2713 Pagination passed for %s backend", store.Type())
+}
+
+// A conditional write must fail once someone else has changed the object.
+func (s *MetadataStoreTestSuite) TestCompareAndSave() {
+	t := s.t
+	store := s.Store
+	ctx := context.Background()
+
+	const bucket = "cas-bucket"
+	if err := store.CreateBucket(ctx, bucket); err != nil {
+		t.Fatalf("Failed to create bucket: %v", err)
+	}
+	defer store.DeleteBucket(ctx, bucket)
+
+	// Revision 0 means "must not exist", so the first write succeeds.
+	first := &ObjectMetadata{ObjectID: "a", Bucket: bucket, Key: "doc", Size: 1}
+	if err := store.CompareAndSaveObjectMetadata(ctx, first, 0); err != nil {
+		t.Fatalf("Create should succeed: %v", err)
+	}
+	if first.Revision == 0 {
+		t.Fatal("Store did not assign a revision")
+	}
+
+	// ...and a second create at revision 0 must not.
+	dup := &ObjectMetadata{ObjectID: "b", Bucket: bucket, Key: "doc", Size: 2}
+	if err := store.CompareAndSaveObjectMetadata(ctx, dup, 0); !errors.Is(err, ErrRevisionMismatch) {
+		t.Errorf("Create over an existing object: got %v, want ErrRevisionMismatch", err)
+	}
+
+	// Two writers both read the same revision; only one can commit.
+	readA, err := store.GetObjectMetadata(ctx, bucket, "doc")
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	readB, err := store.GetObjectMetadata(ctx, bucket, "doc")
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+
+	readA.Size = 100
+	if err := store.CompareAndSaveObjectMetadata(ctx, readA, readA.Revision); err != nil {
+		t.Fatalf("First writer should win: %v", err)
+	}
+
+	readB.Size = 200
+	if err := store.CompareAndSaveObjectMetadata(ctx, readB, readB.Revision); !errors.Is(err, ErrRevisionMismatch) {
+		t.Errorf("Second writer: got %v, want ErrRevisionMismatch", err)
+	}
+
+	final, err := store.GetObjectMetadata(ctx, bucket, "doc")
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if final.Size != 100 {
+		t.Errorf("Stored size is %d; the losing write was applied", final.Size)
+	}
+
+	store.DeleteObjectMetadata(ctx, bucket, "doc")
+	t.Logf("\u2713 Compare-and-save passed for %s backend", store.Type())
 }

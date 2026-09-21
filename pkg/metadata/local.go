@@ -1,12 +1,15 @@
 package metadata
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +58,7 @@ func (s *LocalStore) Type() string {
 	return string(StoreTypeLocal)
 }
 
-func (s *LocalStore) Health() error {
+func (s *LocalStore) Health(ctx context.Context) error {
 	// Check if base path is accessible
 	_, err := os.Stat(s.basePath)
 	return err
@@ -66,12 +69,12 @@ func (s *LocalStore) Close() error {
 	return nil
 }
 
-func (m *LocalStore) CreateBucket(name string) error {
-	return m.CreateBucketWithEncryption(name, EncryptionConfig{Enabled: false})
+func (m *LocalStore) CreateBucket(ctx context.Context, name string) error {
+	return m.CreateBucketWithEncryption(ctx, name, EncryptionConfig{Enabled: false})
 }
 
 // ----------------------- V2/new code -------------------------------
-func (m *LocalStore) CreateBucketWithEncryption(name string, encryption EncryptionConfig) error {
+func (m *LocalStore) CreateBucketWithEncryption(ctx context.Context, name string, encryption EncryptionConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -104,7 +107,7 @@ func (m *LocalStore) CreateBucketWithEncryption(name string, encryption Encrypti
 	return nil
 }
 
-func (m *LocalStore) GetBucket(name string) (*BucketMetadata, error) {
+func (m *LocalStore) GetBucket(ctx context.Context, name string) (*BucketMetadata, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -126,22 +129,22 @@ func (m *LocalStore) GetBucket(name string) (*BucketMetadata, error) {
 	return &bucket, nil
 }
 
-func (m *LocalStore) BucketExists(name string) bool {
+func (m *LocalStore) BucketExists(ctx context.Context, name string) bool {
 	bucketPath := filepath.Join(m.basePath, "buckets", name+".json")
 	_, err := os.Stat(bucketPath)
 	return err == nil
 }
 
-func (m *LocalStore) IsBucketEncrypted(name string) (bool, error) {
-	bucket, err := m.GetBucket(name)
+func (m *LocalStore) IsBucketEncrypted(ctx context.Context, name string) (bool, error) {
+	bucket, err := m.GetBucket(ctx, name)
 	if err != nil {
 		return false, err
 	}
 	return bucket.Encryption.Enabled, nil
 }
 
-func (m *LocalStore) GetBucketEncryption(name string) (*EncryptionConfig, error) {
-	bucket, err := m.GetBucket(name)
+func (m *LocalStore) GetBucketEncryption(ctx context.Context, name string) (*EncryptionConfig, error) {
+	bucket, err := m.GetBucket(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +172,7 @@ func (m *LocalStore) GetBucketEncryption(name string) (*EncryptionConfig, error)
 // 	return buckets, nil
 // }
 
-func (m *LocalStore) ListBuckets() ([]string, error) {
+func (m *LocalStore) ListBuckets(ctx context.Context) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -190,7 +193,7 @@ func (m *LocalStore) ListBuckets() ([]string, error) {
 	return buckets, nil
 }
 
-func (m *LocalStore) DeleteBucket(name string) error {
+func (m *LocalStore) DeleteBucket(ctx context.Context, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -235,57 +238,62 @@ func (m *LocalStore) DeleteBucket(name string) error {
 // 	return nil
 // }
 
-func (m *LocalStore) SaveObjectMetadata(meta *ObjectMetadata) error {
+func (m *LocalStore) SaveObjectMetadata(ctx context.Context, meta *ObjectMetadata) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.saveLocked(meta, anyRevision)
+}
 
+func (m *LocalStore) CompareAndSaveObjectMetadata(ctx context.Context, meta *ObjectMetadata, expectedRevision int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.saveLocked(meta, expectedRevision)
+}
+
+// saveLocked reads the stored revision, checks it against what the caller
+// expected, and writes with the revision bumped.
+//
+// Read-check-write is atomic here only because this store's mutex serialises
+// every writer, which holds while a single process owns the directory. Two
+// Lilio servers sharing one metadata directory would race; that configuration
+// wants etcd, whose transaction does the comparison server-side.
+func (m *LocalStore) saveLocked(meta *ObjectMetadata, expectedRevision int64) error {
 	objectPath := filepath.Join(m.basePath, "objects", meta.Bucket, objectFileName(meta.Key))
 
-	data, err := json.MarshalIndent(meta, "", "  ")
+	var current int64
+	if existing, err := readObjectFile(objectPath); err == nil {
+		current = existing.Revision
+	} else if !errors.Is(err, ErrObjectNotFound) {
+		return err
+	}
+
+	if expectedRevision != anyRevision && current != expectedRevision {
+		return fmt.Errorf("%w: %s/%s is at revision %d, expected %d",
+			ErrRevisionMismatch, meta.Bucket, meta.Key, current, expectedRevision)
+	}
+
+	stored := *meta
+	stored.Revision = current + 1
+
+	data, err := json.MarshalIndent(&stored, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal object metadata: %w", err)
 	}
-
 	if err := fsatomic.WriteFile(objectPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to save object metadata: %w", err)
 	}
 
+	meta.Revision = stored.Revision
 	return nil
 }
 
-// func (m *LocalStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, error) {
-// 	m.mu.RLock()
-// 	defer m.mu.RUnlock()
-
-// 	safeKey := strings.ReplaceAll(key, "/", "_")
-// 	metaFile := filepath.Join(m.BucketsPath, bucket, safeKey+".json")
-
-// 	data, err := os.ReadFile(metaFile)
-// 	if err != nil {
-// 		if os.IsNotExist(err) {
-// 			return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
-// 		}
-// 		return nil, fmt.Errorf("failed to read metadata: %w", err)
-// 	}
-
-// 	var meta ObjectMetadata
-// 	if err := json.Unmarshal(data, &meta); err != nil {
-// 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
-// 	}
-
-// 	return &meta, nil
-// }
-
-func (m *LocalStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	objectPath := filepath.Join(m.basePath, "objects", bucket, objectFileName(key))
-
-	data, err := os.ReadFile(objectPath)
+// readObjectFile loads one metadata file, reporting a missing file as
+// ErrObjectNotFound.
+func readObjectFile(path string) (*ObjectMetadata, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
+			return nil, ErrObjectNotFound
 		}
 		return nil, fmt.Errorf("failed to read object metadata: %w", err)
 	}
@@ -294,10 +302,22 @@ func (m *LocalStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, err
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("failed to parse object metadata: %w", err)
 	}
-
 	return &meta, nil
 }
-func (m *LocalStore) DeleteObjectMetadata(bucket, key string) error {
+func (m *LocalStore) GetObjectMetadata(ctx context.Context, bucket, key string) (*ObjectMetadata, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	meta, err := readObjectFile(filepath.Join(m.basePath, "objects", bucket, objectFileName(key)))
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
+		}
+		return nil, err
+	}
+	return meta, nil
+}
+func (m *LocalStore) DeleteObjectMetadata(ctx context.Context, bucket, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -339,7 +359,14 @@ func (m *LocalStore) DeleteObjectMetadata(bucket, key string) error {
 // 	return objects, nil
 // }
 
-func (m *LocalStore) ListObjects(bucket, prefix string) ([]string, error) {
+// ListObjects returns one page of a bucket's keys.
+//
+// Filenames are hashes, so the keys have to come from inside the files - which
+// means this reads every object's metadata even to return a single page. The
+// pagination bounds the response, not the work. That is acceptable for the
+// local store, which is the development backend; etcd answers the same query
+// with a bounded range scan.
+func (m *LocalStore) ListObjects(ctx context.Context, bucket string, opts ListOptions) (ListResult, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -347,37 +374,35 @@ func (m *LocalStore) ListObjects(bucket, prefix string) ([]string, error) {
 	entries, err := os.ReadDir(objectsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("bucket not found: %s", bucket)
+			return ListResult{}, fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
-		return nil, fmt.Errorf("failed to read objects directory: %w", err)
+		return ListResult{}, fmt.Errorf("failed to read objects directory: %w", err)
 	}
 
-	// Filenames are hashes, so the key has to come from inside each file.
-	// That makes listing O(objects) reads on this backend; acceptable because
-	// the local store is the development backend, while etcd - the backend
-	// meant for real use - answers the same query with one range scan.
-	var objects []string
+	var keys []string
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return ListResult{}, err
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue // skips leftover .tmp-* files from an interrupted write
+			continue // skips leftover temp files from an interrupted write
 		}
 
-		data, err := os.ReadFile(filepath.Join(objectsDir, entry.Name()))
+		meta, err := readObjectFile(filepath.Join(objectsDir, entry.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("failed to read object metadata %s: %w", entry.Name(), err)
+			return ListResult{}, fmt.Errorf("%s: %w", entry.Name(), err)
 		}
-
-		var meta ObjectMetadata
-		if err := json.Unmarshal(data, &meta); err != nil {
-			return nil, fmt.Errorf("failed to parse object metadata %s: %w", entry.Name(), err)
+		if opts.Prefix != "" && !strings.HasPrefix(meta.Key, opts.Prefix) {
+			continue
 		}
-
-		if prefix == "" || strings.HasPrefix(meta.Key, prefix) {
-			objects = append(objects, meta.Key)
+		if opts.After != "" && meta.Key <= opts.After {
+			continue
 		}
+		keys = append(keys, meta.Key)
 	}
 
-	return objects, nil
+	sort.Strings(keys)
+	return paginate(keys, opts.limit()), nil
 }
 
 // Ensure LocalStore implements MetadataStore

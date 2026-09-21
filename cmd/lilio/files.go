@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	netURL "net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -171,41 +172,52 @@ func handleList() {
 		prefix = parts[1]
 	}
 
-	// List objects
-	url := fmt.Sprintf("%s/%s", *server, bucket)
+	// The server returns one page at a time, so follow next_after until the
+	// listing is complete rather than showing a silently truncated result.
+	var all []string
+	after := ""
+	for {
+		url := fmt.Sprintf("%s/%s?prefix=%s", *server, bucket, netURL.QueryEscape(prefix))
+		if after != "" {
+			url += "&after=" + netURL.QueryEscape(after)
+		}
 
-	if prefix != "" {
-		url += "?prefix=" + prefix
+		resp, err := http.Get(url)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			fmt.Println("\nIs the server running? Start with: lilio server")
+			os.Exit(1)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Error: %s\n", string(body))
+			os.Exit(1)
+		}
+		if *jsonOutput {
+			fmt.Println(string(body))
+			return
+		}
+
+		var page struct {
+			Objects   []string `json:"objects"`
+			Truncated bool     `json:"truncated"`
+			NextAfter string   `json:"next_after"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			fmt.Printf("Could not parse the response: %v\n", err)
+			os.Exit(1)
+		}
+
+		all = append(all, page.Objects...)
+		if !page.Truncated {
+			break
+		}
+		after = page.NextAfter
 	}
-	fmt.Println(url)
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		fmt.Println("\nIs the server running? Start with: lilio server")
-		os.Exit(1)
-	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Error: %s\n", string(body))
-		os.Exit(1)
-	}
-
-	if *jsonOutput {
-		fmt.Println(string(body))
-		return
-	}
-
-	// Parse response
-	var result struct {
-		Bucket  string   `json:"bucket"`
-		Objects []string `json:"objects"`
-	}
-	json.Unmarshal(body, &result)
-
-	if len(result.Objects) == 0 {
+	if len(all) == 0 {
 		fmt.Printf("No objects in %s", bucket)
 		if prefix != "" {
 			fmt.Printf(" with prefix '%s'", prefix)
@@ -215,10 +227,10 @@ func handleList() {
 	}
 
 	fmt.Printf("Objects in %s:\n", bucket)
-	for _, obj := range result.Objects {
+	for _, obj := range all {
 		fmt.Printf("  %s\n", obj)
 	}
-	fmt.Printf("\nTotal: %d objects\n", len(result.Objects))
+	fmt.Printf("\nTotal: %d objects\n", len(all))
 }
 
 func handleDelete() {

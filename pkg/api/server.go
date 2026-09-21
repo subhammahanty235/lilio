@@ -51,6 +51,11 @@ func writeObjectError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, metadata.ErrObjectNotFound), errors.Is(err, metadata.ErrBucketNotFound):
 		errorResponse(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, metadata.ErrRevisionMismatch):
+		// Someone else wrote this key while this request was uploading. The
+		// request was well-formed and may well succeed on a retry, so this is
+		// a conflict rather than a server fault.
+		errorResponse(w, http.StatusConflict, err.Error())
 	default:
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 	}
@@ -144,7 +149,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		buckets, err := s.lio.ListBuckets()
+		buckets, err := s.lio.ListBuckets(r.Context())
 		if err != nil {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
@@ -159,7 +164,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListBucketsDetailed(w http.ResponseWriter, r *http.Request) {
-	bucketNames, err := s.lio.ListBuckets()
+	bucketNames, err := s.lio.ListBuckets(r.Context())
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -173,7 +178,7 @@ func (s *Server) handleListBucketsDetailed(w http.ResponseWriter, r *http.Reques
 
 	var bucketsInfo []BucketInfo
 	for _, name := range bucketNames {
-		bucketMeta, err := s.lio.Metadata.GetBucket(name)
+		bucketMeta, err := s.lio.Metadata.GetBucket(r.Context(), name)
 		if err != nil {
 			// If we can't get metadata, just add basic info
 			bucketsInfo = append(bucketsInfo, BucketInfo{
@@ -275,9 +280,9 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 
 		var err error
 		if encryption == "aes256" && password != "" {
-			err = s.lio.CreateBucketWithEncryption(bucket, password)
+			err = s.lio.CreateBucketWithEncryption(r.Context(), bucket, password)
 		} else {
-			err = s.lio.CreateBucket(bucket)
+			err = s.lio.CreateBucket(r.Context(), bucket)
 		}
 
 		if err != nil {
@@ -292,19 +297,41 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 	// case get
 	case http.MethodGet:
 		// List objects in bucket
-		prefix := r.URL.Query().Get("prefix")
-		objects, err := s.lio.ListObjects(bucket, prefix)
+		// One page of objects. A bucket can hold more than fits in a response,
+		// so callers page with ?after=, using next_after from the last page.
+		limit := 0
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 {
+				errorResponse(w, http.StatusBadRequest, "limit must be a non-negative integer")
+				return
+			}
+			limit = parsed
+		}
+
+		page, err := s.lio.ListObjects(r.Context(), bucket, metadata.ListOptions{
+			Prefix: r.URL.Query().Get("prefix"),
+			After:  r.URL.Query().Get("after"),
+			Limit:  limit,
+		})
 		if err != nil {
-			errorResponse(w, http.StatusNotFound, err.Error())
+			writeObjectError(w, err)
 			return
 		}
+
+		objects := page.Keys
+		if objects == nil {
+			objects = []string{}
+		}
 		jsonResponse(w, http.StatusOK, map[string]interface{}{
-			"bucket":  bucket,
-			"objects": objects,
+			"bucket":     bucket,
+			"objects":    objects,
+			"truncated":  page.Truncated,
+			"next_after": page.NextAfter,
 		})
 	case http.MethodDelete:
 		// Delete bucket
-		if err := s.lio.Metadata.DeleteBucket(bucket); err != nil {
+		if err := s.lio.Metadata.DeleteBucket(r.Context(), bucket); err != nil {
 			errorResponse(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -351,7 +378,7 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 
-	if err := s.lio.UnlockBucket(bucket, password); err != nil {
+	if err := s.lio.UnlockBucket(r.Context(), bucket, password); err != nil {
 		errorResponse(w, http.StatusUnauthorized, err.Error())
 		return
 	}
@@ -385,7 +412,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		})
 
 	case http.MethodGet:
-		meta, err := s.lio.HeadObject(bucket, key)
+		meta, err := s.lio.HeadObject(r.Context(), bucket, key)
 		if err != nil {
 			writeObjectError(w, err)
 			return
@@ -413,7 +440,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		body.commit()
 
 	case http.MethodHead:
-		meta, err := s.lio.HeadObject(bucket, key)
+		meta, err := s.lio.HeadObject(r.Context(), bucket, key)
 		if err != nil {
 			writeObjectError(w, err)
 			return

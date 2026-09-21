@@ -1,6 +1,9 @@
 package metadata
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 /*
 Pluggable Metadata Store Interface
@@ -24,27 +27,92 @@ Usage:
   })
 */
 
+// MetadataStore keeps the map from object keys to the chunks that make up an
+// object. It is the only unreplicated thing in Lilio: chunks live on N nodes
+// and are repaired when they go missing, while the map describing them has one
+// copy. Losing it turns every chunk into unreadable bytes.
+//
+// Every method takes a context. The store can be etcd across a network, where
+// a call can hang rather than fail, and a request that the client has already
+// abandoned should not keep a connection busy.
 type MetadataStore interface {
 	// Bucket operations
-	CreateBucket(name string) error
-	CreateBucketWithEncryption(name string, encryption EncryptionConfig) error
-	GetBucket(name string) (*BucketMetadata, error)
-	ListBuckets() ([]string, error)
-	DeleteBucket(name string) error
-	BucketExists(name string) bool
-	IsBucketEncrypted(name string) (bool, error)
-	GetBucketEncryption(name string) (*EncryptionConfig, error)
+	CreateBucket(ctx context.Context, name string) error
+	CreateBucketWithEncryption(ctx context.Context, name string, encryption EncryptionConfig) error
+	GetBucket(ctx context.Context, name string) (*BucketMetadata, error)
+	ListBuckets(ctx context.Context) ([]string, error)
+	DeleteBucket(ctx context.Context, name string) error
+	BucketExists(ctx context.Context, name string) bool
+	IsBucketEncrypted(ctx context.Context, name string) (bool, error)
+	GetBucketEncryption(ctx context.Context, name string) (*EncryptionConfig, error)
 
 	// Object operations
-	SaveObjectMetadata(meta *ObjectMetadata) error
-	GetObjectMetadata(bucket, key string) (*ObjectMetadata, error)
-	DeleteObjectMetadata(bucket, key string) error
-	ListObjects(bucket, prefix string) ([]string, error)
+	SaveObjectMetadata(ctx context.Context, meta *ObjectMetadata) error
+
+	// CompareAndSaveObjectMetadata writes metadata only if the stored object is
+	// still at expectedRevision, and returns ErrRevisionMismatch otherwise. An
+	// expectedRevision of 0 means the object must not already exist.
+	//
+	// This is what stops two concurrent writes to one key from silently
+	// discarding each other. Without it both writers commit, the later one
+	// wins, and the earlier one's chunks are left referenced by nothing with
+	// neither client told anything went wrong.
+	CompareAndSaveObjectMetadata(ctx context.Context, meta *ObjectMetadata, expectedRevision int64) error
+
+	GetObjectMetadata(ctx context.Context, bucket, key string) (*ObjectMetadata, error)
+	DeleteObjectMetadata(ctx context.Context, bucket, key string) error
+
+	// ListObjects returns one page of a bucket's keys, in ascending order.
+	ListObjects(ctx context.Context, bucket string, opts ListOptions) (ListResult, error)
 
 	// Health & Lifecycle
-	Health() error
+	Health(ctx context.Context) error
 	Close() error
 	Type() string
+}
+
+// DefaultListLimit bounds a page when the caller does not choose one, so that
+// a listing of a large bucket cannot pull the whole thing into memory by
+// accident.
+const DefaultListLimit = 1000
+
+// MaxListLimit caps what a caller can ask for in one page.
+const MaxListLimit = 10000
+
+// ListOptions bounds one page of a listing.
+type ListOptions struct {
+	// Prefix restricts the listing to keys starting with it.
+	Prefix string
+
+	// After resumes the listing from the key following it, exclusive. Pass the
+	// NextAfter from the previous page.
+	After string
+
+	// Limit is the maximum number of keys to return. 0 means DefaultListLimit.
+	Limit int
+}
+
+func (o ListOptions) limit() int {
+	switch {
+	case o.Limit <= 0:
+		return DefaultListLimit
+	case o.Limit > MaxListLimit:
+		return MaxListLimit
+	default:
+		return o.Limit
+	}
+}
+
+// ListResult is one page of keys.
+type ListResult struct {
+	Keys []string
+
+	// NextAfter is the value to pass as ListOptions.After to get the next page.
+	// Empty when the listing is complete.
+	NextAfter string
+
+	// Truncated reports whether more keys remain.
+	Truncated bool
 }
 
 type EncryptionConfig struct {
@@ -82,6 +150,13 @@ type ChunkInfo struct {
 }
 
 type ObjectMetadata struct {
+	// Revision is assigned by the metadata store and is opaque to callers.
+	// Pass the value read from the store back to
+	// CompareAndSaveObjectMetadata to make a write conditional on nothing else
+	// having changed the object in the meantime. Zero means the object does
+	// not exist yet.
+	Revision int64 `json:"revision,omitempty"`
+
 	ObjectID    string      `json:"object_id"`
 	Bucket      string      `json:"bucket"`
 	Key         string      `json:"key"`

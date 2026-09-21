@@ -172,9 +172,10 @@ What Lilio guarantees:
 
 What it does not guarantee:
 
-- **Concurrent writes to the same key race.** Both write chunks, both write
-  metadata, last one wins, and the loser's chunks are orphaned with no error
-  reported to either client. Metadata has no compare-and-swap yet.
+- **Concurrent writes to the same key conflict.** One commits; the other gets
+  HTTP 409 and removes the chunks it uploaded. Less permissive than S3, which
+  takes the last write silently — but nothing is left orphaned and no client is
+  told a write succeeded when it did not.
 - **Nothing is atomic across objects.** There are no multi-object transactions.
 - **Metadata is a single point of failure.** Chunks are replicated; the map
   describing them is not. Lose it and the chunks are unreadable bytes.
@@ -200,11 +201,24 @@ durability comes from the other replicas and the scrubber — see
 | type | use | notes |
 |---|---|---|
 | `local` | default, single machine | JSON files, atomic + fsynced writes |
-| `etcd` | multiple coordinators, or when metadata loss is unacceptable | strongly consistent, replicated |
+| `etcd` | more than one writer, or when metadata loss is unacceptable | strongly consistent, replicated, bounded range scans |
 | `memory` | tests | ephemeral |
 
 `local` is the default so that `lilio server` works with no dependencies. Use
-`etcd` if you care about the metadata single-point-of-failure noted above.
+`etcd` if you care about the metadata single-point-of-failure noted above, or
+if more than one process will write metadata — the local store's
+compare-and-swap holds only because a single process owns the directory, while
+etcd does the comparison server-side in a transaction.
+
+```json
+"metadata": {
+  "type": "etcd",
+  "etcd": { "endpoints": ["localhost:2379"], "prefix": "/lilio", "dial_timeout": "5s" }
+}
+```
+
+The etcd backend is covered by the same conformance suite as the others, which
+runs against `localhost:2379` when etcd is reachable and skips otherwise.
 
 Object keys are hashed to produce metadata filenames rather than escaped,
 because a filename cannot represent an arbitrary key — it is length-limited,
@@ -291,7 +305,7 @@ startup.
 | `GET` | `/` | list buckets |
 | `PUT` | `/{bucket}` | create bucket (`?encryption=aes256&password=…` to encrypt) |
 | `DELETE` | `/{bucket}` | delete an empty bucket |
-| `GET` | `/{bucket}?prefix=` | list objects |
+| `GET` | `/{bucket}?prefix=&after=&limit=` | list one page of objects |
 | `POST` | `/{bucket}/unlock?password=` | unlock an encrypted bucket |
 | `PUT` | `/{bucket}/{key}` | upload |
 | `GET` | `/{bucket}/{key}` | download |
@@ -330,7 +344,7 @@ after encryption.
 | crash between metadata commit and chunk cleanup | old chunks are orphaned; the current object is fine |
 | crash mid chunk write | previous chunk survives intact; a temp file is left behind |
 | crash mid metadata write | previous metadata survives intact |
-| two clients write the same key | **both succeed, last one wins, no error** — a known gap |
+| two clients write the same key | one commits; the other gets 409 and removes the chunks it uploaded |
 | coordinator dies | everything stops; it is a single point of failure |
 
 ## Testing
@@ -347,8 +361,9 @@ survives on disk.
 
 ## Known limitations
 
-- No compare-and-swap on metadata, so concurrent writes to one key race.
-- `ListObjects` has no pagination; it loads every object in a bucket.
+- Listings are paged, but the local store still reads every object's metadata
+  to produce a page — the page bounds the response, not the work. etcd scans a
+  bounded range.
 - Node membership comes from the config file. Adding a node means editing it
   and restarting; there is no failure detection or rebalancing.
 - The coordinator is a single point of failure, as is the metadata store when
@@ -366,6 +381,7 @@ survives on disk.
 - [0002 — Chunk metadata records intent, not outcome](docs/adr/0002-metadata-records-intent.md)
 - [0003 — Lilio has no read quorum](docs/adr/0003-no-read-quorum.md)
 - [0004 — Atomic file writes, and where durability comes from](docs/adr/0004-atomic-writes.md)
+- [0005 — Concurrent writes to one key conflict rather than racing](docs/adr/0005-compare-and-swap-on-metadata.md)
 
 ## License
 

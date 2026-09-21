@@ -13,4 +13,8 @@ var (
 	ErrBucketExists   = errors.New("bucket already exists")
 	ErrBucketNotEmpty = errors.New("bucket not empty")
 	ErrObjectNotFound = errors.New("object not found")
+
+	// ErrRevisionMismatch means the object changed between being read and
+	// being written back - another writer got there first.
+	ErrRevisionMismatch = errors.New("object was modified concurrently")
 )

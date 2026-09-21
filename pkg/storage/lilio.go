@@ -276,7 +276,7 @@ func (s *Lilio) onlineBackends(names []string) []StorageBackend {
 	return selected
 }
 
-func (s *Lilio) CreateBucketWithEncryption(bucketName, password string) error {
+func (s *Lilio) CreateBucketWithEncryption(ctx context.Context, bucketName, password string) error {
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return fmt.Errorf("failed to generate salt: %w", err)
@@ -300,17 +300,17 @@ func (s *Lilio) CreateBucketWithEncryption(bucketName, password string) error {
 		KeyHash:   hex.EncodeToString(keyHash[:]),
 	}
 
-	return s.Metadata.CreateBucketWithEncryption(bucketName, encConfig)
+	return s.Metadata.CreateBucketWithEncryption(ctx, bucketName, encConfig)
 }
 
 // Public API
 // Craete bucket
-func (s *Lilio) CreateBucket(bucketname string) error {
-	return s.Metadata.CreateBucket(bucketname)
+func (s *Lilio) CreateBucket(ctx context.Context, bucketname string) error {
+	return s.Metadata.CreateBucket(ctx, bucketname)
 }
 
-func (s *Lilio) UnlockBucket(bucketName, password string) error {
-	encConfig, err := s.Metadata.GetBucketEncryption(bucketName)
+func (s *Lilio) UnlockBucket(ctx context.Context, bucketName, password string) error {
+	encConfig, err := s.Metadata.GetBucketEncryption(ctx, bucketName)
 	if err != nil {
 		return err
 	}
@@ -349,8 +349,8 @@ func (s *Lilio) getEncryptor(bucketName string) *crypto.Encryptor {
 }
 
 // List buckets
-func (s *Lilio) ListBuckets() ([]string, error) {
-	return s.Metadata.ListBuckets()
+func (s *Lilio) ListBuckets(ctx context.Context) ([]string, error) {
+	return s.Metadata.ListBuckets(ctx)
 }
 
 // Todo : Delete buckets
@@ -437,7 +437,7 @@ func (s *Lilio) ListBuckets() ([]string, error) {
 // }
 
 func (s *Lilio) PutObject(ctx context.Context, bucket, key string, reader io.Reader, size int64, contentType string) (*metadata.ObjectMetadata, error) {
-	if !s.Metadata.BucketExists(bucket) {
+	if !s.Metadata.BucketExists(ctx, bucket) {
 		return nil, fmt.Errorf("bucket does not exist: %s", bucket)
 	}
 
@@ -447,12 +447,16 @@ func (s *Lilio) PutObject(ctx context.Context, bucket, key string, reader io.Rea
 	// entirely new set of chunk IDs and the previous object's chunks become
 	// unreferenced the moment the new metadata commits. Capture them now so
 	// they can be reclaimed once that commit has succeeded.
+	// The revision this write is replacing. Zero means "there is nothing here
+	// yet", and the commit below is conditional on that still being true.
 	var superseded []metadata.ChunkInfo
-	if prev, err := s.Metadata.GetObjectMetadata(bucket, key); err == nil {
+	var expectedRevision int64
+	if prev, err := s.Metadata.GetObjectMetadata(ctx, bucket, key); err == nil {
 		superseded = prev.Chunks
+		expectedRevision = prev.Revision
 	}
 
-	isEncrypted, _ := s.Metadata.IsBucketEncrypted(bucket)
+	isEncrypted, _ := s.Metadata.IsBucketEncrypted(ctx, bucket)
 	var encryptor *crypto.Encryptor
 
 	if isEncrypted {
@@ -578,7 +582,16 @@ func (s *Lilio) PutObject(ctx context.Context, bucket, key string, reader io.Rea
 		Encrypted:   isEncrypted,
 	}
 
-	if err := s.Metadata.SaveObjectMetadata(meta); err != nil {
+	if err := s.Metadata.CompareAndSaveObjectMetadata(ctx, meta, expectedRevision); err != nil {
+		if errors.Is(err, metadata.ErrRevisionMismatch) {
+			// Another write to this key committed while this one was uploading.
+			// Its chunks are the ones the object now refers to; ours refer to
+			// nothing, so they are removed rather than left as garbage. The
+			// caller is told it lost rather than being allowed to believe a
+			// write succeeded that was immediately overwritten.
+			s.deleteChunks(chunkInfos)
+			return nil, fmt.Errorf("concurrent write to %s/%s: %w", bucket, key, err)
+		}
 		return nil, fmt.Errorf("failed to save metadata: %w", err)
 	}
 
@@ -615,7 +628,7 @@ func (s *Lilio) GetObjectOld(ctx context.Context, bucket, key string) ([]byte, e
 	// deassemble the data
 	// ----------------------------
 
-	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
+	meta, err := s.Metadata.GetObjectMetadata(ctx, bucket, key)
 	if err != nil {
 		return nil, err
 	}
@@ -677,7 +690,7 @@ func (s *Lilio) GetObjectOld(ctx context.Context, bucket, key string) ([]byte, e
 
 func (s *Lilio) GetObject(ctx context.Context, bucket, key string, writer io.Writer) error {
 	startTime := time.Now()
-	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
+	meta, err := s.Metadata.GetObjectMetadata(ctx, bucket, key)
 	if err != nil {
 		return err
 	}
@@ -843,8 +856,8 @@ func (s *Lilio) readRepair(chunkId string, data []byte, staleNodes []string) {
 	}
 }
 
-func (s *Lilio) HeadObject(bucket, key string) (*metadata.ObjectMetadata, error) {
-	return s.Metadata.GetObjectMetadata(bucket, key)
+func (s *Lilio) HeadObject(ctx context.Context, bucket, key string) (*metadata.ObjectMetadata, error) {
+	return s.Metadata.GetObjectMetadata(ctx, bucket, key)
 }
 
 // DeleteObject removes an object and reclaims its chunks.
@@ -853,7 +866,7 @@ func (s *Lilio) HeadObject(bucket, key string) (*metadata.ObjectMetadata, error)
 // idempotent so that a client which times out and retries does not get a
 // failure on the retry, when the first attempt in fact succeeded.
 func (s *Lilio) DeleteObject(ctx context.Context, bucket, key string) error {
-	meta, err := s.Metadata.GetObjectMetadata(bucket, key)
+	meta, err := s.Metadata.GetObjectMetadata(ctx, bucket, key)
 	if err != nil {
 		if errors.Is(err, metadata.ErrObjectNotFound) {
 			return nil
@@ -867,7 +880,7 @@ func (s *Lilio) DeleteObject(ctx context.Context, bucket, key string) error {
 	// have already been deleted: the object would still appear in listings and
 	// every read of it would fail, permanently. Leaked storage is a bookkeeping
 	// problem; a dangling pointer is data loss.
-	if err := s.Metadata.DeleteObjectMetadata(bucket, key); err != nil {
+	if err := s.Metadata.DeleteObjectMetadata(ctx, bucket, key); err != nil {
 		if errors.Is(err, metadata.ErrObjectNotFound) {
 			return nil // lost a race with a concurrent delete; still the desired state
 		}
@@ -908,8 +921,10 @@ func (s *Lilio) deleteChunks(chunks []metadata.ChunkInfo) {
 	}
 }
 
-func (s *Lilio) ListObjects(bucket, prefix string) ([]string, error) {
-	return s.Metadata.ListObjects(bucket, prefix)
+// ListObjects returns one page of a bucket's keys. Pass the previous page's
+// NextAfter in opts.After to continue.
+func (s *Lilio) ListObjects(ctx context.Context, bucket string, opts metadata.ListOptions) (metadata.ListResult, error) {
+	return s.Metadata.ListObjects(ctx, bucket, opts)
 }
 
 // Storage stats

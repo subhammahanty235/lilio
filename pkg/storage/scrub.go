@@ -104,18 +104,18 @@ func (r *ScrubReport) String() string {
 // that should already have it, so a scrub racing with a write or a delete can
 // at worst re-place a chunk that is about to become garbage - it can never
 // remove data. Orphan detection is likewise report-only; see collectOrphans.
-func (s *Lilio) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubReport, error) {
+func (s *Lilio) Scrub(ctx context.Context, options ScrubOptions) (*ScrubReport, error) {
 	report := &ScrubReport{
 		StartedAt: time.Now(),
-		Deep:      opts.Deep,
-		DryRun:    opts.DryRun,
+		Deep:      options.Deep,
+		DryRun:    options.DryRun,
 	}
 	defer func() {
 		report.Duration = time.Since(report.StartedAt)
 		report.DurationHuman = report.Duration.Round(time.Millisecond).String()
 	}()
 
-	buckets, err := s.Metadata.ListBuckets()
+	buckets, err := s.Metadata.ListBuckets(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list buckets: %w", err)
 	}
@@ -123,45 +123,59 @@ func (s *Lilio) Scrub(ctx context.Context, opts ScrubOptions) (*ScrubReport, err
 	referenced := make(map[string]bool)
 
 	for _, bucket := range buckets {
-		keys, err := s.Metadata.ListObjects(bucket, "")
-		if err != nil {
-			report.Errors = append(report.Errors, fmt.Sprintf("list objects in %s: %v", bucket, err))
-			continue
-		}
-
-		for _, key := range keys {
+		// Paged, because a bucket can hold more objects than fit in memory and
+		// a scrub of a large store is exactly when that matters.
+		opts := metadata.ListOptions{}
+		for {
 			if err := ctx.Err(); err != nil {
 				return report, err
 			}
 
-			meta, err := s.Metadata.GetObjectMetadata(bucket, key)
+			page, err := s.Metadata.ListObjects(ctx, bucket, opts)
 			if err != nil {
-				// Most likely deleted while we were scanning; not an error
-				// worth failing the pass over.
-				report.Errors = append(report.Errors, fmt.Sprintf("read metadata %s/%s: %v", bucket, key, err))
-				continue
+				report.Errors = append(report.Errors, fmt.Sprintf("list objects in %s: %v", bucket, err))
+				break
 			}
-			report.ObjectsScanned++
 
-			for _, chunk := range meta.Chunks {
-				referenced[chunk.ChunkID] = true
-				report.ChunksScanned++
+			for _, key := range page.Keys {
+				if err := ctx.Err(); err != nil {
+					return report, err
+				}
 
-				issue := s.scrubChunk(ctx, bucket, key, chunk, opts)
-				if issue == nil {
-					report.ChunksHealthy++
+				meta, err := s.Metadata.GetObjectMetadata(ctx, bucket, key)
+				if err != nil {
+					// Most likely deleted while we were scanning; not an error
+					// worth failing the pass over.
+					report.Errors = append(report.Errors, fmt.Sprintf("read metadata %s/%s: %v", bucket, key, err))
 					continue
 				}
+				report.ObjectsScanned++
 
-				report.Issues = append(report.Issues, *issue)
-				report.ReplicasRestored += len(issue.RepairedOn)
-				switch {
-				case issue.Unrepairable:
-					report.ChunksUnrepairable++
-				case len(issue.RepairedOn) > 0:
-					report.ChunksRepaired++
+				for _, chunk := range meta.Chunks {
+					referenced[chunk.ChunkID] = true
+					report.ChunksScanned++
+
+					issue := s.scrubChunk(ctx, bucket, key, chunk, options)
+					if issue == nil {
+						report.ChunksHealthy++
+						continue
+					}
+
+					report.Issues = append(report.Issues, *issue)
+					report.ReplicasRestored += len(issue.RepairedOn)
+					switch {
+					case issue.Unrepairable:
+						report.ChunksUnrepairable++
+					case len(issue.RepairedOn) > 0:
+						report.ChunksRepaired++
+					}
 				}
 			}
+
+			if !page.Truncated {
+				break
+			}
+			opts.After = page.NextAfter
 		}
 	}
 

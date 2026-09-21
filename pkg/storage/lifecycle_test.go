@@ -50,7 +50,7 @@ func TestDeleteObjectRemovesChunksAndMetadata(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	if _, err := lilio.Metadata.GetObjectMetadata("test-bucket", "doomed"); !errors.Is(err, metadata.ErrObjectNotFound) {
+	if _, err := lilio.Metadata.GetObjectMetadata(context.Background(), "test-bucket", "doomed"); !errors.Is(err, metadata.ErrObjectNotFound) {
 		t.Errorf("Metadata after delete: got %v, want ErrObjectNotFound", err)
 	}
 
@@ -149,7 +149,7 @@ func TestFailedWriteLeavesNoMetadata(t *testing.T) {
 		t.Fatal("Expected the write to fail when quorum cannot be met")
 	}
 
-	if _, err := lilio.Metadata.GetObjectMetadata("test-bucket", "partial"); !errors.Is(err, metadata.ErrObjectNotFound) {
+	if _, err := lilio.Metadata.GetObjectMetadata(context.Background(), "test-bucket", "partial"); !errors.Is(err, metadata.ErrObjectNotFound) {
 		t.Errorf("A failed write must not publish metadata: got %v, want ErrObjectNotFound", err)
 	}
 }

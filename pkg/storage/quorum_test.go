@@ -263,7 +263,7 @@ func setupTestLilio(t *testing.T, n, w int) *Lilio {
 	}
 
 	// Create test bucket
-	if err := lilio.CreateBucket("test-bucket"); err != nil {
+	if err := lilio.CreateBucket(context.Background(), "test-bucket"); err != nil {
 		t.Fatalf("Failed to create test bucket: %v", err)
 	}
 
@@ -311,9 +311,16 @@ type MockBackend struct {
 	name   string
 	mu     sync.RWMutex
 	chunks map[string][]byte
+
+	// storeDelay slows writes, so a test can hold two operations open at once
+	// and make a race deterministic instead of hoping for it.
+	storeDelay time.Duration
 }
 
 func (m *MockBackend) StoreChunk(ctx context.Context, chunkID string, data []byte) error {
+	if m.storeDelay > 0 {
+		time.Sleep(m.storeDelay)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.chunks[chunkID] = data

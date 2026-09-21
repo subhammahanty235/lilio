@@ -255,3 +255,40 @@ func TestTruncatedReadIsNotSilent(t *testing.T) {
 		"a client would treat this as a complete object",
 		len(data), len(body), getResp.StatusCode)
 }
+
+// A write that loses a race must be reported as a conflict, not a server
+// fault: the request was fine and a retry may well succeed.
+func TestConcurrentWriteReturnsConflict(t *testing.T) {
+	baseURL, _ := testServer(t)
+
+	body := strings.Repeat("contended ", 2000)
+	type result struct{ status int }
+	results := make(chan result, 2)
+
+	for i := 0; i < 2; i++ {
+		go func() {
+			resp := do(t, http.MethodPut, baseURL+"/b/contested.txt", body)
+			resp.Body.Close()
+			results <- result{resp.StatusCode}
+		}()
+	}
+
+	var created, conflicted int
+	for i := 0; i < 2; i++ {
+		switch r := <-results; r.status {
+		case http.StatusCreated:
+			created++
+		case http.StatusConflict:
+			conflicted++
+		default:
+			t.Errorf("Unexpected status %d", r.status)
+		}
+	}
+
+	if created == 0 {
+		t.Error("Neither write committed")
+	}
+	if created+conflicted != 2 {
+		t.Errorf("Got %d created and %d conflicted", created, conflicted)
+	}
+}

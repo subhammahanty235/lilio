@@ -67,7 +67,7 @@ func newCluster(t *testing.T, nodes int) *cluster {
 	if err != nil {
 		t.Fatalf("Failed to create coordinator: %v", err)
 	}
-	if err := lilio.CreateBucket("data"); err != nil {
+	if err := lilio.CreateBucket(context.Background(), "data"); err != nil {
 		t.Fatalf("Failed to create bucket: %v", err)
 	}
 

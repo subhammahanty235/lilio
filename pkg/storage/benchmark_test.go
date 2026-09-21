@@ -220,7 +220,7 @@ func BenchmarkMetadataSave(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		meta.Key = fmt.Sprintf("bench-key-%d", i)
-		err := lilio.Metadata.SaveObjectMetadata(meta)
+		err := lilio.Metadata.SaveObjectMetadata(context.Background(), meta)
 		if err != nil {
 			b.Fatalf("SaveObjectMetadata failed: %v", err)
 		}
@@ -252,12 +252,12 @@ func BenchmarkMetadataGet(b *testing.B) {
 		CreatedAt:   time.Now(),
 		ContentType: "application/octet-stream",
 	}
-	lilio.Metadata.SaveObjectMetadata(meta)
+	lilio.Metadata.SaveObjectMetadata(context.Background(), meta)
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_, err := lilio.Metadata.GetObjectMetadata("bench-bucket", "bench-get-key")
+		_, err := lilio.Metadata.GetObjectMetadata(context.Background(), "bench-bucket", "bench-get-key")
 		if err != nil {
 			b.Fatalf("GetObjectMetadata failed: %v", err)
 		}
@@ -410,7 +410,7 @@ func setupBenchLilio(b *testing.B, n, w, r int) *Lilio {
 	}
 
 	// Create test bucket
-	if err := lilio.CreateBucket("bench-bucket"); err != nil {
+	if err := lilio.CreateBucket(context.Background(), "bench-bucket"); err != nil {
 		b.Fatalf("Failed to create bucket: %v", err)
 	}
 
