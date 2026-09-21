@@ -43,6 +43,17 @@ func handleInit() {
 				"path": "./lilio_data/storage/local-2",
 			},
 		},
+		{
+			// Three, to match the default replication factor: with only two
+			// backends the derived quorum needs both of them for every
+			// operation, so either one failing takes the whole store down.
+			Name:     "local-3",
+			Type:     "local",
+			Priority: 3,
+			Options: map[string]string{
+				"path": "./lilio_data/storage/local-3",
+			},
+		},
 	}
 
 	if err := cfg.Save(*configPath); err != nil {

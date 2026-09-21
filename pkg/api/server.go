@@ -2,11 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/subhammahanty235/lilio/pkg/metadata"
 	"github.com/subhammahanty235/lilio/pkg/storage"
 	"github.com/subhammahanty235/lilio/pkg/web"
 )
@@ -31,6 +34,76 @@ func jsonResponse(w http.ResponseWriter, status int, data interface{}) {
 
 func errorResponse(w http.ResponseWriter, status int, message string) {
 	jsonResponse(w, status, map[string]string{"error": message})
+}
+
+// writeObjectError maps a storage error onto an HTTP status.
+//
+// Telling absence apart from failure matters to the client: a 404 means the
+// object is not there and the request should not be repeated, a 500 means
+// something broke and a retry may well succeed. This handler previously
+// returned 404 for every error, including an unreachable metadata backend.
+func writeObjectError(w http.ResponseWriter, err error) {
+	// Discard any object headers staged before the failure became known.
+	w.Header().Del("Content-Length")
+	w.Header().Del("ETag")
+	w.Header().Del("Last-Modified")
+
+	switch {
+	case errors.Is(err, metadata.ErrObjectNotFound), errors.Is(err, metadata.ErrBucketNotFound):
+		errorResponse(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, metadata.ErrRevisionMismatch):
+		// Someone else wrote this key while this request was uploading. The
+		// request was well-formed and may well succeed on a retry, so this is
+		// a conflict rather than a server fault.
+		errorResponse(w, http.StatusConflict, err.Error())
+	default:
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+// setObjectHeaders stages the response headers describing an object. They are
+// not sent until something calls WriteHeader, which lets a caller stage them
+// and still change its mind.
+func setObjectHeaders(w http.ResponseWriter, meta *metadata.ObjectMetadata) {
+	contentType := meta.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+	w.Header().Set("ETag", `"`+meta.Checksum+`"`)
+	w.Header().Set("Last-Modified", meta.CreatedAt.UTC().Format(http.TimeFormat))
+}
+
+// deferredWriter holds back the response status line until the handler actually
+// produces a byte of body.
+//
+// A streaming read cannot know it will succeed before it starts: an object's
+// metadata can be perfectly readable while its chunks are not. Sending the
+// status eagerly makes that failure unreportable, which is how a read that
+// recovered nothing could still answer "200 OK" with an empty body. Deferring
+// the status keeps a real error code available for as long as nothing has been
+// sent, and makes it explicit at the point of failure that the choice is gone.
+type deferredWriter struct {
+	w       http.ResponseWriter
+	status  int
+	n       int64
+	written bool
+}
+
+func (d *deferredWriter) Write(p []byte) (int, error) {
+	d.commit()
+	n, err := d.w.Write(p)
+	d.n += int64(n)
+	return n, err
+}
+
+// commit sends the status line if it has not gone out already.
+func (d *deferredWriter) commit() {
+	if !d.written {
+		d.written = true
+		d.w.WriteHeader(d.status)
+	}
 }
 
 func parsePath(path string) (bucket, key string) {
@@ -76,7 +149,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		buckets, err := s.lio.ListBuckets()
+		buckets, err := s.lio.ListBuckets(r.Context())
 		if err != nil {
 			errorResponse(w, http.StatusInternalServerError, err.Error())
 			return
@@ -91,7 +164,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListBucketsDetailed(w http.ResponseWriter, r *http.Request) {
-	bucketNames, err := s.lio.ListBuckets()
+	bucketNames, err := s.lio.ListBuckets(r.Context())
 	if err != nil {
 		errorResponse(w, http.StatusInternalServerError, err.Error())
 		return
@@ -105,7 +178,7 @@ func (s *Server) handleListBucketsDetailed(w http.ResponseWriter, r *http.Reques
 
 	var bucketsInfo []BucketInfo
 	for _, name := range bucketNames {
-		bucketMeta, err := s.lio.Metadata.GetBucket(name)
+		bucketMeta, err := s.lio.Metadata.GetBucket(r.Context(), name)
 		if err != nil {
 			// If we can't get metadata, just add basic info
 			bucketsInfo = append(bucketsInfo, BucketInfo{
@@ -128,13 +201,13 @@ func (s *Server) handleListBucketsDetailed(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleBucketsOrObjects(w http.ResponseWriter, r *http.Request) {
 	bucket, key := parsePath(r.URL.Path)
 	if bucket == "admin" && key == "stats" {
-		stats := s.lio.GetStorageStats()
+		stats := s.lio.GetStorageStats(r.Context())
 		jsonResponse(w, http.StatusOK, stats)
 		return
 	}
 
 	if bucket == "admin" && key == "health" {
-		healthErrors := s.lio.HealthCheck()
+		healthErrors := s.lio.HealthCheck(r.Context())
 
 		// Convert to a more user-friendly format
 		healthStatus := make(map[string]interface{})
@@ -177,6 +250,11 @@ func (s *Server) handleBucketsOrObjects(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if bucket == "admin" && key == "scrub" {
+		s.handleScrub(w, r)
+		return
+	}
+
 	// Handle unlock endpoint
 	if key == "unlock" && r.Method == http.MethodPost {
 		s.handleUnlock(w, r, bucket)
@@ -202,9 +280,9 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 
 		var err error
 		if encryption == "aes256" && password != "" {
-			err = s.lio.CreateBucketWithEncryption(bucket, password)
+			err = s.lio.CreateBucketWithEncryption(r.Context(), bucket, password)
 		} else {
-			err = s.lio.CreateBucket(bucket)
+			err = s.lio.CreateBucket(r.Context(), bucket)
 		}
 
 		if err != nil {
@@ -219,19 +297,41 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 	// case get
 	case http.MethodGet:
 		// List objects in bucket
-		prefix := r.URL.Query().Get("prefix")
-		objects, err := s.lio.ListObjects(bucket, prefix)
+		// One page of objects. A bucket can hold more than fits in a response,
+		// so callers page with ?after=, using next_after from the last page.
+		limit := 0
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 {
+				errorResponse(w, http.StatusBadRequest, "limit must be a non-negative integer")
+				return
+			}
+			limit = parsed
+		}
+
+		page, err := s.lio.ListObjects(r.Context(), bucket, metadata.ListOptions{
+			Prefix: r.URL.Query().Get("prefix"),
+			After:  r.URL.Query().Get("after"),
+			Limit:  limit,
+		})
 		if err != nil {
-			errorResponse(w, http.StatusNotFound, err.Error())
+			writeObjectError(w, err)
 			return
 		}
+
+		objects := page.Keys
+		if objects == nil {
+			objects = []string{}
+		}
 		jsonResponse(w, http.StatusOK, map[string]interface{}{
-			"bucket":  bucket,
-			"objects": objects,
+			"bucket":     bucket,
+			"objects":    objects,
+			"truncated":  page.Truncated,
+			"next_after": page.NextAfter,
 		})
 	case http.MethodDelete:
 		// Delete bucket
-		if err := s.lio.Metadata.DeleteBucket(bucket); err != nil {
+		if err := s.lio.Metadata.DeleteBucket(r.Context(), bucket); err != nil {
 			errorResponse(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -246,6 +346,31 @@ func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket str
 
 }
 
+// handleScrub runs an anti-entropy pass and returns what it found.
+//
+// POST, not GET: a scrub writes data (it restores missing replicas) and is
+// expensive, so it should not be something a crawler or a link click triggers.
+func (s *Server) handleScrub(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errorResponse(w, http.StatusMethodNotAllowed, "scrub must be triggered with POST")
+		return
+	}
+
+	opts := storage.ScrubOptions{
+		Deep:   r.URL.Query().Get("deep") == "true",
+		DryRun: r.URL.Query().Get("dry_run") == "true",
+	}
+
+	report, err := s.lio.Scrub(r.Context(), opts)
+	if err != nil {
+		errorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	log.Printf("%s", report)
+	jsonResponse(w, http.StatusOK, report)
+}
+
 func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, bucket string) {
 	password := r.URL.Query().Get("password")
 	if password == "" {
@@ -253,7 +378,7 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 
-	if err := s.lio.UnlockBucket(bucket, password); err != nil {
+	if err := s.lio.UnlockBucket(r.Context(), bucket, password); err != nil {
 		errorResponse(w, http.StatusUnauthorized, err.Error())
 		return
 	}
@@ -266,16 +391,17 @@ func (s *Server) handleUnlock(w http.ResponseWriter, r *http.Request, bucket str
 func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	switch r.Method {
 	case http.MethodPut:
+		defer r.Body.Close()
+
 		contentType := r.Header.Get("Content-Type")
 		if contentType == "" {
 			contentType = "application/octet-stream"
 		}
-		meta, err := s.lio.PutObject(bucket, key, r.Body, r.ContentLength, contentType)
+		meta, err := s.lio.PutObject(r.Context(), bucket, key, r.Body, r.ContentLength, contentType)
 		if err != nil {
-			errorResponse(w, http.StatusInternalServerError, err.Error())
+			writeObjectError(w, err)
 			return
 		}
-		defer r.Body.Close()
 
 		jsonResponse(w, http.StatusCreated, map[string]interface{}{
 			"message":  "Object stored",
@@ -286,31 +412,65 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request, bucket, ke
 		})
 
 	case http.MethodGet:
-		metadata, err := s.lio.HeadObject(bucket, key)
+		meta, err := s.lio.HeadObject(r.Context(), bucket, key)
 		if err != nil {
-			errorResponse(w, http.StatusNotFound, err.Error())
+			writeObjectError(w, err)
 			return
 		}
+		setObjectHeaders(w, meta)
 
-		contentType := "application/octet-stream"
-		if metadata != nil && metadata.ContentType != "" {
-			contentType = metadata.ContentType
+		body := &deferredWriter{w: w, status: http.StatusOK}
+		if err := s.lio.GetObject(r.Context(), bucket, key, body); err != nil {
+			if !body.written {
+				// Nothing has reached the client yet, so the failure can still
+				// be reported as a status code.
+				writeObjectError(w, err)
+				return
+			}
+			// The status line is already on the wire and cannot be withdrawn.
+			// Breaking the connection is the only honest signal left: the
+			// client then sees a failed transfer rather than a truncated body
+			// that looks like a complete one. ErrAbortHandler aborts without
+			// logging a panic trace.
+			log.Printf("Error streaming object %s/%s after %d of %d bytes: %v",
+				bucket, key, body.n, meta.Size, err)
+			panic(http.ErrAbortHandler)
 		}
+		// A zero-byte object never triggers a Write, so it still needs a status.
+		body.commit()
 
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", metadata.Size))
+	case http.MethodHead:
+		meta, err := s.lio.HeadObject(r.Context(), bucket, key)
+		if err != nil {
+			writeObjectError(w, err)
+			return
+		}
+		// net/http discards any body written in response to a HEAD, so only
+		// these headers reach the client. No storage backend is touched.
+		setObjectHeaders(w, meta)
 		w.WriteHeader(http.StatusOK)
 
-		// Stream directly to response writer
-		if err := s.lio.GetObject(bucket, key, w); err != nil {
-			// Can't send error response here, headers already sent
-			log.Printf("Error streaming object: %v", err)
+	case http.MethodDelete:
+		if err := s.lio.DeleteObject(r.Context(), bucket, key); err != nil {
+			writeObjectError(w, err)
+			return
 		}
-	}
+		// 204: succeeded, nothing to return. Deleting an object that was
+		// already gone also reports success - see Lilio.DeleteObject on why
+		// DELETE has to be idempotent.
+		w.WriteHeader(http.StatusNoContent)
 
+	default:
+		// Without this, an unhandled method fell through the switch and
+		// net/http answered 200 with an empty body - which is how DELETE
+		// appeared to succeed while doing nothing at all.
+		errorResponse(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
-func (s *Server) Start() error {
+// Handler builds the server's HTTP routing. Start serves it; tests exercise it
+// directly without binding a port.
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/ui", web.ServeUI)
@@ -322,6 +482,12 @@ func (s *Server) Start() error {
 			mux.Handle("/metrics", handler)
 		}
 	}
+
+	return mux
+}
+
+func (s *Server) Start() error {
+	handler := s.Handler()
 
 	fmt.Printf(`
 ╔════════════════════════════════════════════════════════════╗
@@ -347,10 +513,11 @@ func (s *Server) Start() error {
 ║    POST   /{bucket}/unlock     - Unlock encrypted bucket   ║
 ║    GET    /admin/stats         - Storage statistics        ║
 ║    GET    /admin/health        - Backend health status     ║
+║    POST   /admin/scrub         - Repair missing replicas   ║
 ║                                                            ║
 ║  Press Ctrl+C to stop                                      ║
 ╚════════════════════════════════════════════════════════════╝
 `, s.addr, s.addr, s.lio.Metrics.Type(), s.addr)
 	log.Printf("Starting server on %s", s.addr)
-	return http.ListenAndServe(s.addr, mux)
+	return http.ListenAndServe(s.addr, handler)
 }

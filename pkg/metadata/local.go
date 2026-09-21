@@ -1,14 +1,37 @@
 package metadata
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/subhammahanty235/lilio/internal/fsatomic"
 )
+
+// objectFileName maps an object key to the file that holds its metadata.
+//
+// The key is hashed rather than escaped because a filename cannot represent an
+// arbitrary key: it is length-limited, may be case-insensitive (as on macOS and
+// Windows), and cannot contain a path separator. Any escaping scheme therefore
+// has keys it silently maps onto the same file, and two distinct keys sharing a
+// file means writing one destroys the other. Hashing has no such collisions in
+// practice, at the cost of an opaque filename.
+//
+// The real key is not lost: it is stored inside the file as ObjectMetadata.Key,
+// which is where ListObjects reads it back from.
+func objectFileName(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:]) + ".json"
+}
 
 type LocalStore struct {
 	basePath string
@@ -35,7 +58,7 @@ func (s *LocalStore) Type() string {
 	return string(StoreTypeLocal)
 }
 
-func (s *LocalStore) Health() error {
+func (s *LocalStore) Health(ctx context.Context) error {
 	// Check if base path is accessible
 	_, err := os.Stat(s.basePath)
 	return err
@@ -46,19 +69,19 @@ func (s *LocalStore) Close() error {
 	return nil
 }
 
-func (m *LocalStore) CreateBucket(name string) error {
-	return m.CreateBucketWithEncryption(name, EncryptionConfig{Enabled: false})
+func (m *LocalStore) CreateBucket(ctx context.Context, name string) error {
+	return m.CreateBucketWithEncryption(ctx, name, EncryptionConfig{Enabled: false})
 }
 
 // ----------------------- V2/new code -------------------------------
-func (m *LocalStore) CreateBucketWithEncryption(name string, encryption EncryptionConfig) error {
+func (m *LocalStore) CreateBucketWithEncryption(ctx context.Context, name string, encryption EncryptionConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	bucketPath := filepath.Join(m.basePath, "buckets", name+".json")
 
 	if _, err := os.Stat(bucketPath); err == nil {
-		return fmt.Errorf("bucket already exists: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketExists, name)
 	}
 
 	bucket := BucketMetadata{
@@ -72,7 +95,7 @@ func (m *LocalStore) CreateBucketWithEncryption(name string, encryption Encrypti
 		return fmt.Errorf("failed to marshal bucket metadata: %w", err)
 	}
 
-	if err := os.WriteFile(bucketPath, data, 0644); err != nil {
+	if err := fsatomic.WriteFile(bucketPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to save bucket metadata: %w", err)
 	}
 
@@ -84,7 +107,7 @@ func (m *LocalStore) CreateBucketWithEncryption(name string, encryption Encrypti
 	return nil
 }
 
-func (m *LocalStore) GetBucket(name string) (*BucketMetadata, error) {
+func (m *LocalStore) GetBucket(ctx context.Context, name string) (*BucketMetadata, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -93,7 +116,7 @@ func (m *LocalStore) GetBucket(name string) (*BucketMetadata, error) {
 	data, err := os.ReadFile(bucketPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("bucket not found: %s", name)
+			return nil, fmt.Errorf("%w: %s", ErrBucketNotFound, name)
 		}
 		return nil, fmt.Errorf("failed to read bucket metadata: %w", err)
 	}
@@ -106,22 +129,22 @@ func (m *LocalStore) GetBucket(name string) (*BucketMetadata, error) {
 	return &bucket, nil
 }
 
-func (m *LocalStore) BucketExists(name string) bool {
+func (m *LocalStore) BucketExists(ctx context.Context, name string) bool {
 	bucketPath := filepath.Join(m.basePath, "buckets", name+".json")
 	_, err := os.Stat(bucketPath)
 	return err == nil
 }
 
-func (m *LocalStore) IsBucketEncrypted(name string) (bool, error) {
-	bucket, err := m.GetBucket(name)
+func (m *LocalStore) IsBucketEncrypted(ctx context.Context, name string) (bool, error) {
+	bucket, err := m.GetBucket(ctx, name)
 	if err != nil {
 		return false, err
 	}
 	return bucket.Encryption.Enabled, nil
 }
 
-func (m *LocalStore) GetBucketEncryption(name string) (*EncryptionConfig, error) {
-	bucket, err := m.GetBucket(name)
+func (m *LocalStore) GetBucketEncryption(ctx context.Context, name string) (*EncryptionConfig, error) {
+	bucket, err := m.GetBucket(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +172,7 @@ func (m *LocalStore) GetBucketEncryption(name string) (*EncryptionConfig, error)
 // 	return buckets, nil
 // }
 
-func (m *LocalStore) ListBuckets() ([]string, error) {
+func (m *LocalStore) ListBuckets(ctx context.Context) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -170,14 +193,14 @@ func (m *LocalStore) ListBuckets() ([]string, error) {
 	return buckets, nil
 }
 
-func (m *LocalStore) DeleteBucket(name string) error {
+func (m *LocalStore) DeleteBucket(ctx context.Context, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	objectsDir := filepath.Join(m.basePath, "objects", name)
 	entries, _ := os.ReadDir(objectsDir)
 	if len(entries) > 0 {
-		return fmt.Errorf("bucket not empty: %s", name)
+		return fmt.Errorf("%w: %s", ErrBucketNotEmpty, name)
 	}
 
 	os.RemoveAll(objectsDir)
@@ -215,59 +238,62 @@ func (m *LocalStore) DeleteBucket(name string) error {
 // 	return nil
 // }
 
-func (m *LocalStore) SaveObjectMetadata(meta *ObjectMetadata) error {
+func (m *LocalStore) SaveObjectMetadata(ctx context.Context, meta *ObjectMetadata) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.saveLocked(meta, anyRevision)
+}
 
-	safeKey := strings.ReplaceAll(meta.Key, "/", "_")
-	objectPath := filepath.Join(m.basePath, "objects", meta.Bucket, safeKey+".json")
+func (m *LocalStore) CompareAndSaveObjectMetadata(ctx context.Context, meta *ObjectMetadata, expectedRevision int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.saveLocked(meta, expectedRevision)
+}
 
-	data, err := json.MarshalIndent(meta, "", "  ")
+// saveLocked reads the stored revision, checks it against what the caller
+// expected, and writes with the revision bumped.
+//
+// Read-check-write is atomic here only because this store's mutex serialises
+// every writer, which holds while a single process owns the directory. Two
+// Lilio servers sharing one metadata directory would race; that configuration
+// wants etcd, whose transaction does the comparison server-side.
+func (m *LocalStore) saveLocked(meta *ObjectMetadata, expectedRevision int64) error {
+	objectPath := filepath.Join(m.basePath, "objects", meta.Bucket, objectFileName(meta.Key))
+
+	var current int64
+	if existing, err := readObjectFile(objectPath); err == nil {
+		current = existing.Revision
+	} else if !errors.Is(err, ErrObjectNotFound) {
+		return err
+	}
+
+	if expectedRevision != anyRevision && current != expectedRevision {
+		return fmt.Errorf("%w: %s/%s is at revision %d, expected %d",
+			ErrRevisionMismatch, meta.Bucket, meta.Key, current, expectedRevision)
+	}
+
+	stored := *meta
+	stored.Revision = current + 1
+
+	data, err := json.MarshalIndent(&stored, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal object metadata: %w", err)
 	}
-
-	if err := os.WriteFile(objectPath, data, 0644); err != nil {
+	if err := fsatomic.WriteFile(objectPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to save object metadata: %w", err)
 	}
 
+	meta.Revision = stored.Revision
 	return nil
 }
 
-// func (m *LocalStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, error) {
-// 	m.mu.RLock()
-// 	defer m.mu.RUnlock()
-
-// 	safeKey := strings.ReplaceAll(key, "/", "_")
-// 	metaFile := filepath.Join(m.BucketsPath, bucket, safeKey+".json")
-
-// 	data, err := os.ReadFile(metaFile)
-// 	if err != nil {
-// 		if os.IsNotExist(err) {
-// 			return nil, fmt.Errorf("object not found: %s/%s", bucket, key)
-// 		}
-// 		return nil, fmt.Errorf("failed to read metadata: %w", err)
-// 	}
-
-// 	var meta ObjectMetadata
-// 	if err := json.Unmarshal(data, &meta); err != nil {
-// 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
-// 	}
-
-// 	return &meta, nil
-// }
-
-func (m *LocalStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	safeKey := strings.ReplaceAll(key, "/", "_")
-	objectPath := filepath.Join(m.basePath, "objects", bucket, safeKey+".json")
-
-	data, err := os.ReadFile(objectPath)
+// readObjectFile loads one metadata file, reporting a missing file as
+// ErrObjectNotFound.
+func readObjectFile(path string) (*ObjectMetadata, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("object not found: %s/%s", bucket, key)
+			return nil, ErrObjectNotFound
 		}
 		return nil, fmt.Errorf("failed to read object metadata: %w", err)
 	}
@@ -276,19 +302,30 @@ func (m *LocalStore) GetObjectMetadata(bucket, key string) (*ObjectMetadata, err
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("failed to parse object metadata: %w", err)
 	}
-
 	return &meta, nil
 }
-func (m *LocalStore) DeleteObjectMetadata(bucket, key string) error {
+func (m *LocalStore) GetObjectMetadata(ctx context.Context, bucket, key string) (*ObjectMetadata, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	meta, err := readObjectFile(filepath.Join(m.basePath, "objects", bucket, objectFileName(key)))
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			return nil, fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
+		}
+		return nil, err
+	}
+	return meta, nil
+}
+func (m *LocalStore) DeleteObjectMetadata(ctx context.Context, bucket, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	safeKey := strings.ReplaceAll(key, "/", "_")
-	objectPath := filepath.Join(m.basePath, "objects", bucket, safeKey+".json")
+	objectPath := filepath.Join(m.basePath, "objects", bucket, objectFileName(key))
 
 	if err := os.Remove(objectPath); err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("object not found: %s/%s", bucket, key)
+			return fmt.Errorf("%w: %s/%s", ErrObjectNotFound, bucket, key)
 		}
 		return fmt.Errorf("failed to delete metadata: %w", err)
 	}
@@ -322,7 +359,14 @@ func (m *LocalStore) DeleteObjectMetadata(bucket, key string) error {
 // 	return objects, nil
 // }
 
-func (m *LocalStore) ListObjects(bucket, prefix string) ([]string, error) {
+// ListObjects returns one page of a bucket's keys.
+//
+// Filenames are hashes, so the keys have to come from inside the files - which
+// means this reads every object's metadata even to return a single page. The
+// pagination bounds the response, not the work. That is acceptable for the
+// local store, which is the development backend; etcd answers the same query
+// with a bounded range scan.
+func (m *LocalStore) ListObjects(ctx context.Context, bucket string, opts ListOptions) (ListResult, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -330,24 +374,35 @@ func (m *LocalStore) ListObjects(bucket, prefix string) ([]string, error) {
 	entries, err := os.ReadDir(objectsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("bucket not found: %s", bucket)
+			return ListResult{}, fmt.Errorf("%w: %s", ErrBucketNotFound, bucket)
 		}
-		return nil, fmt.Errorf("failed to read objects directory: %w", err)
+		return ListResult{}, fmt.Errorf("failed to read objects directory: %w", err)
 	}
 
-	var objects []string
+	var keys []string
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
-			key := strings.TrimSuffix(entry.Name(), ".json")
-			key = strings.ReplaceAll(key, "_", "/")
-
-			if prefix == "" || strings.HasPrefix(key, prefix) {
-				objects = append(objects, key)
-			}
+		if err := ctx.Err(); err != nil {
+			return ListResult{}, err
 		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue // skips leftover temp files from an interrupted write
+		}
+
+		meta, err := readObjectFile(filepath.Join(objectsDir, entry.Name()))
+		if err != nil {
+			return ListResult{}, fmt.Errorf("%s: %w", entry.Name(), err)
+		}
+		if opts.Prefix != "" && !strings.HasPrefix(meta.Key, opts.Prefix) {
+			continue
+		}
+		if opts.After != "" && meta.Key <= opts.After {
+			continue
+		}
+		keys = append(keys, meta.Key)
 	}
 
-	return objects, nil
+	sort.Strings(keys)
+	return paginate(keys, opts.limit()), nil
 }
 
 // Ensure LocalStore implements MetadataStore

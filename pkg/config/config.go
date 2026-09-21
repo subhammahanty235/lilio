@@ -5,19 +5,99 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 type Config struct {
 	Lilio    LilioConfig     `json:"lilio"`
+	Metadata *MetadataConfig `json:"metadata,omitempty"`
+	Metrics  *MetricsConfig  `json:"metrics,omitempty"`
+	Scrub    *ScrubConfig    `json:"scrub,omitempty"`
 	Storages []StorageConfig `json:"storages"`
 }
 
 // LilioConfig holds core settings
 type LilioConfig struct {
-	ChunkSize         string `json:"chunk_size"`
-	ReplicationFactor int    `json:"replication_factor"`
-	MetadataPath      string `json:"metadata_path"`
-	APIPort           int    `json:"api_port"`
+	ChunkSize         string        `json:"chunk_size"`
+	ReplicationFactor int           `json:"replication_factor"`
+	Quorum            *QuorumConfig `json:"quorum,omitempty"`
+	MetadataPath      string        `json:"metadata_path"`
+	APIPort           int           `json:"api_port"`
+}
+
+// QuorumConfig overrides the replication policy derived from
+// replication_factor. Leave it out to let Lilio pick a majority write quorum.
+type QuorumConfig struct {
+	N int `json:"N"`
+	W int `json:"W"`
+
+	// R is accepted so that existing config files keep loading, and ignored.
+	// Lilio no longer has a read quorum: chunks are immutable, so one replica
+	// whose bytes match the metadata checksum is proof enough, and demanding R
+	// of them only made objects unreadable that were provably intact.
+	R int `json:"R,omitempty"`
+}
+
+// EffectiveN returns the configured N, or the replication factor when N is
+// omitted - the common case, since a replica count different from the
+// replication factor is rarely what anyone means.
+func (q *QuorumConfig) EffectiveN(replicationFactor int) int {
+	if q.N > 0 {
+		return q.N
+	}
+	return replicationFactor
+}
+
+// MetadataConfig selects the metadata backend. Type is one of "local"
+// (the default), "etcd", or "memory".
+type MetadataConfig struct {
+	Type  string               `json:"type"`
+	Local *LocalMetadataConfig `json:"local,omitempty"`
+	Etcd  *EtcdMetadataConfig  `json:"etcd,omitempty"`
+}
+
+type LocalMetadataConfig struct {
+	Path string `json:"path"`
+}
+
+type EtcdMetadataConfig struct {
+	Endpoints   []string `json:"endpoints"`
+	Prefix      string   `json:"prefix,omitempty"`
+	DialTimeout string   `json:"dial_timeout,omitempty"` // Go duration, e.g. "5s"
+	Username    string   `json:"username,omitempty"`
+	Password    string   `json:"password,omitempty"`
+}
+
+// ScrubConfig turns on a periodic anti-entropy pass. Left out, scrubbing only
+// happens when asked for (lilio scrub, or POST /admin/scrub).
+type ScrubConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Interval string `json:"interval"`       // Go duration, e.g. "6h"
+	Deep     bool   `json:"deep,omitempty"` // verify checksums, not just presence
+}
+
+// IntervalDuration parses Interval, defaulting to 6h.
+func (s *ScrubConfig) IntervalDuration() (time.Duration, error) {
+	if s.Interval == "" {
+		return 6 * time.Hour, nil
+	}
+	return time.ParseDuration(s.Interval)
+}
+
+// MetricsConfig controls the metrics collector. Type is "prometheus"
+// (the default) or "nouse" to disable collection.
+type MetricsConfig struct {
+	Enabled bool   `json:"enabled"`
+	Type    string `json:"type,omitempty"`
+	Path    string `json:"path,omitempty"`
+}
+
+// DialTimeoutDuration parses DialTimeout, falling back to 5s when unset.
+func (e *EtcdMetadataConfig) DialTimeoutDuration() (time.Duration, error) {
+	if e.DialTimeout == "" {
+		return 5 * time.Second, nil
+	}
+	return time.ParseDuration(e.DialTimeout)
 }
 
 // StorageConfig holds configuration for a single storage backend
@@ -31,8 +111,11 @@ type StorageConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Lilio: LilioConfig{
-			ChunkSize:         "1MB",
-			ReplicationFactor: 2,
+			ChunkSize: "1MB",
+			// 3, not 2: with a replication factor of 2 the derived quorum is
+			// N=2, W=2, R=2, so losing either backend fails every read and
+			// every write. 3 is the smallest factor that tolerates one loss.
+			ReplicationFactor: 3,
 			MetadataPath:      "./lilio_data/metadata",
 			APIPort:           8080,
 		},
@@ -91,6 +174,52 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("replication_factor must be at least 1")
 	}
 
+	if q := c.Lilio.Quorum; q != nil {
+		// The W+R > N rule is enforced by the storage core, which owns it.
+		// Checked here are the bounds that would otherwise fail silently at
+		// runtime: a W above N can never be reached, so every write would fail.
+		n := q.EffectiveN(c.Lilio.ReplicationFactor)
+		if q.W < 1 {
+			return fmt.Errorf("quorum W must be at least 1")
+		}
+		if q.W > n {
+			return fmt.Errorf("quorum W(%d) cannot exceed N(%d)", q.W, n)
+		}
+	}
+
+	if m := c.Metadata; m != nil {
+		switch m.Type {
+		case "", "local", "memory":
+		case "etcd":
+			if m.Etcd == nil || len(m.Etcd.Endpoints) == 0 {
+				return fmt.Errorf("metadata type etcd requires etcd.endpoints")
+			}
+			if _, err := m.Etcd.DialTimeoutDuration(); err != nil {
+				return fmt.Errorf("invalid metadata etcd.dial_timeout: %w", err)
+			}
+		default:
+			return fmt.Errorf("unknown metadata type: %s", m.Type)
+		}
+	}
+
+	if sc := c.Scrub; sc != nil && sc.Enabled {
+		d, err := sc.IntervalDuration()
+		if err != nil {
+			return fmt.Errorf("invalid scrub.interval: %w", err)
+		}
+		if d < time.Minute {
+			return fmt.Errorf("scrub.interval must be at least 1m, got %s", d)
+		}
+	}
+
+	if m := c.Metrics; m != nil && m.Enabled {
+		switch m.Type {
+		case "", "prometheus", "nouse":
+		default:
+			return fmt.Errorf("unknown metrics type: %s", m.Type)
+		}
+	}
+
 	names := make(map[string]bool)
 	for _, s := range c.Storages {
 		if s.Name == "" {
@@ -103,9 +232,21 @@ func (c *Config) Validate() error {
 
 		validTypes := map[string]bool{
 			"local": true, "gdrive": true, "dropbox": true, "s3": true, "sftp": true,
+			"remote": true,
 		}
 		if !validTypes[s.Type] {
 			return fmt.Errorf("invalid storage type: %s", s.Type)
+		}
+
+		if s.Type == "remote" {
+			if s.GetOption("url", "") == "" {
+				return fmt.Errorf("storage %q: remote backend requires a 'url' option", s.Name)
+			}
+			if t := s.GetOption("timeout", ""); t != "" {
+				if _, err := time.ParseDuration(t); err != nil {
+					return fmt.Errorf("storage %q: invalid timeout %q: %w", s.Name, t, err)
+				}
+			}
 		}
 	}
 

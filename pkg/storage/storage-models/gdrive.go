@@ -217,8 +217,8 @@ func (g *GDriveBackend) Info() storage.BackendInfo {
 }
 
 // Health checks if Google Drive is accessible
-func (g *GDriveBackend) Health() error {
-	_, err := g.service.About.Get().Fields("user").Do()
+func (g *GDriveBackend) Health(ctx context.Context) error {
+	_, err := g.service.About.Get().Fields("user").Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("google drive not accessible: %w", err)
 	}
@@ -226,7 +226,7 @@ func (g *GDriveBackend) Health() error {
 }
 
 // StoreChunk uploads a chunk to Google Drive
-func (g *GDriveBackend) StoreChunk(chunkID string, data []byte) error {
+func (g *GDriveBackend) StoreChunk(ctx context.Context, chunkID string, data []byte) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -239,7 +239,7 @@ func (g *GDriveBackend) StoreChunk(chunkID string, data []byte) error {
 	}
 
 	reader := &byteReader{data: data}
-	uploaded, err := g.service.Files.Create(file).Media(reader).Fields("id, size").Do()
+	uploaded, err := g.service.Files.Create(file).Media(reader).Fields("id, size").Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("failed to upload chunk: %w", err)
 	}
@@ -251,7 +251,7 @@ func (g *GDriveBackend) StoreChunk(chunkID string, data []byte) error {
 }
 
 // RetrieveChunk downloads a chunk from Google Drive
-func (g *GDriveBackend) RetrieveChunk(chunkID string) ([]byte, error) {
+func (g *GDriveBackend) RetrieveChunk(ctx context.Context, chunkID string) ([]byte, error) {
 	g.mu.RLock()
 	fileID, exists := g.chunkCache[chunkID]
 	g.mu.RUnlock()
@@ -259,7 +259,7 @@ func (g *GDriveBackend) RetrieveChunk(chunkID string) ([]byte, error) {
 	if !exists {
 		return nil, fmt.Errorf("chunk not found: %s", chunkID)
 	}
-	resp, err := g.service.Files.Get(fileID).Download()
+	resp, err := g.service.Files.Get(fileID).Context(ctx).Download()
 	if err != nil {
 		return nil, fmt.Errorf("failed to download chunk: %w", err)
 	}
@@ -274,7 +274,7 @@ func (g *GDriveBackend) RetrieveChunk(chunkID string) ([]byte, error) {
 }
 
 // DeleteChunk removes a chunk from Google Drive
-func (g *GDriveBackend) DeleteChunk(chunkID string) error {
+func (g *GDriveBackend) DeleteChunk(ctx context.Context, chunkID string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -283,7 +283,7 @@ func (g *GDriveBackend) DeleteChunk(chunkID string) error {
 		return nil
 	}
 
-	err := g.service.Files.Delete(fileID).Do()
+	err := g.service.Files.Delete(fileID).Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("failed to delete chunk: %w", err)
 	}
@@ -295,7 +295,7 @@ func (g *GDriveBackend) DeleteChunk(chunkID string) error {
 }
 
 // HasChunk checks if chunk exists
-func (g *GDriveBackend) HasChunk(chunkID string) bool {
+func (g *GDriveBackend) HasChunk(ctx context.Context, chunkID string) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -304,7 +304,7 @@ func (g *GDriveBackend) HasChunk(chunkID string) bool {
 }
 
 // ListChunks returns all chunk IDs
-func (g *GDriveBackend) ListChunks() ([]string, error) {
+func (g *GDriveBackend) ListChunks(ctx context.Context) ([]string, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -316,11 +316,11 @@ func (g *GDriveBackend) ListChunks() ([]string, error) {
 }
 
 // Stats returns storage statistics
-func (g *GDriveBackend) Stats() (storage.BackendStats, error) {
+func (g *GDriveBackend) Stats(ctx context.Context) (storage.BackendStats, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	about, err := g.service.About.Get().Fields("storageQuota").Do()
+	about, err := g.service.About.Get().Fields("storageQuota").Context(ctx).Do()
 	var bytesFree int64 = -1
 	if err == nil && about.StorageQuota != nil {
 		limit := about.StorageQuota.Limit

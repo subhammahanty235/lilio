@@ -34,6 +34,8 @@ func main() {
 		handleBucket()
 	case "health":
 		handleHealth()
+	case "scrub":
+		handleScrub()
 	case "init":
 		handleInit()
 	case "version", "-v", "--version":
@@ -73,6 +75,7 @@ Commands:
   rm <bucket>/<key>           Delete an object
   
   health                      Check health of all backends
+  scrub [--deep] [--dry-run]  Verify replicas and restore missing copies
   version                     Show version
   help                        Show this help
 
